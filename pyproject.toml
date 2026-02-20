@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pylsp-workspace-symbols"
+version = "0.1.0"
+description = "workspace/symbol support for python-lsp-server via Jedi"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+keywords = ["pylsp", "python-lsp-server", "lsp", "jedi", "workspace-symbols"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Editors",
+]
+dependencies = [
+    "python-lsp-server>=1.7",
+    "jedi>=0.18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-cov",
+    "python-lsp-server[all]",
+]
+
+[project.urls]
+Homepage = "https://github.com/Hanatarou/pylsp-workspace-symbols"
+Repository = "https://github.com/Hanatarou/pylsp-workspace-symbols"
+"Bug Tracker" = "https://github.com/Hanatarou/pylsp-workspace-symbols/issues"
+
+[project.entry-points.pylsp]
+pylsp_workspace_symbols = "pylsp_workspace_symbols.plugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pylsp_workspace_symbols*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
