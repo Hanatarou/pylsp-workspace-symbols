@@ -74,8 +74,8 @@ class TestInIgnoredFolder:
                                   _DEFAULT_IGNORE_FOLDERS)
 
     def test_ignores_egg_info(self):
-        assert _in_ignored_folder("/project/mylib.egg-info/PKG-INFO",
-                                  _DEFAULT_IGNORE_FOLDERS)
+        assert _in_ignored_folder("/project/pylsp_workspace_symbols.egg-info/PKG-INFO",
+                              _DEFAULT_IGNORE_FOLDERS)
 
     def test_allows_normal_path(self):
         assert not _in_ignored_folder("/project/src/mymodule.py",
