@@ -1,5 +1,11 @@
 # pylsp-workspace-symbols
 
+[![CI](https://github.com/Hanatarou/pylsp-workspace-symbols/actions/workflows/ci.yml/badge.svg)](https://github.com/Hanatarou/pylsp-workspace-symbols/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pylsp-workspace-symbols)](https://pypi.org/project/pylsp-workspace-symbols)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/pylsp-workspace-symbols)](https://pypi.org/project/pylsp-workspace-symbols)
+[![Downloads](https://img.shields.io/pypi/dm/pylsp-workspace-symbols)](https://pypistats.org/packages/pylsp-workspace-symbols)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hanatarou/pylsp-workspace-symbols/blob/main/LICENSE)
+
 A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace/symbol** support via [Jedi](https://github.com/davidhalter/jedi).
 
 > **Why?** `pylsp` does not implement `workspace/symbol` natively. This plugin fills that gap, enabling "Go to Symbol in Workspace" in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others.
