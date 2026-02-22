@@ -6,19 +6,20 @@
 [![Downloads](https://img.shields.io/pypi/dm/pylsp-workspace-symbols)](https://pypistats.org/packages/pylsp-workspace-symbols)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hanatarou/pylsp-workspace-symbols/blob/main/LICENSE)
 
-A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace/symbol** support via [Jedi](https://github.com/davidhalter/jedi).
+A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace/symbol search** and **inlay hints** via [Jedi](https://github.com/davidhalter/jedi).
 
-> **Why?** `pylsp` does not implement `workspace/symbol` natively. This plugin fills that gap, enabling "Go to Symbol in Workspace" in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others.
+> **Why?** `pylsp` does not implement `workspace/symbol` natively, and its inlay hints support is limited. This plugin fills both gaps, enabling "Go to Symbol in Workspace" and rich type inference hints in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others.
 
 ---
 
 ## ✨ Features
 
 - 🔍 **Workspace-wide symbol search** — find functions, classes, and modules across all files in the project
+- 💡 **Inlay hints** — inline type annotations inferred by Jedi for assignments, return types, raised exceptions, and parameter names at call sites
 - ⚡ **Fast** — results in ~130ms after the first call (Jedi cache warm)
 - 🔤 **Case-insensitive substring match** — `area` finds `calculate_area`, `Cal` finds `Calculator`
 - 📁 **Smart folder exclusion** — automatically skips `.git`, `__pycache__`, `node_modules`, `.venv`, `dist`, `build`, and more
-- ⚙️ **Configurable** — tune `max_symbols` and `ignore_folders` via pylsp settings
+- ⚙️ **Configurable** — tune all options via pylsp settings
 - 🐍 **Python 3.8+** — compatible with all modern Python versions
 
 ## 📦 Installation
@@ -41,17 +42,38 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
         "enabled": true,
         "max_symbols": 500,
         "ignore_folders": []
+      },
+      "inlay_hints": {
+        "enabled": true,
+        "show_assign_types": true,
+        "show_return_types": true,
+        "show_raises": true,
+        "show_parameter_hints": true,
+        "max_hints_per_file": 200
       }
     }
   }
 }
 ```
 
+### Workspace symbol options
+
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `true` | Enable/disable the plugin |
+| `enabled` | bool | `true` | Enable/disable workspace symbol search |
 | `max_symbols` | int | `500` | Maximum symbols returned. `0` means no limit |
 | `ignore_folders` | list | `[]` | Extra folder names to skip (merged with built-in list) |
+
+### Inlay hint options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable all inlay hints |
+| `show_assign_types` | bool | `true` | Show inferred types for unannotated assignments (`x = 42` → `: int`) |
+| `show_return_types` | bool | `true` | Show inferred return types for unannotated functions (`def f():` → `-> str`) |
+| `show_raises` | bool | `true` | Show raised exception types (`raise ValueError(...)` → `Raises: ValueError`) |
+| `show_parameter_hints` | bool | `true` | Show parameter names at call sites (`f(1, 2)` → `a=1, b=2`) |
+| `max_hints_per_file` | int | `200` | Maximum hints per file. `0` means no limit |
 
 ### Built-in ignored folders
 
@@ -60,19 +82,45 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
 
 ## 🚀 Usage
 
+### Workspace symbol search
+
 Once installed, your LSP client will receive `workspaceSymbolProvider: true` in the server capabilities.
 Use your client's "Go to Symbol in Workspace" command (typically `Ctrl+T` or `#` in the symbol picker).
 
-### How it works
+### Inlay hints
 
-pylsp does not define a `pylsp_workspace_symbols` hookspec, so this plugin uses two hooks:
+Your LSP client will receive `inlayHintProvider: true` in the server capabilities. Hints are
+rendered inline by the client automatically. The following hint types are supported:
+
+- **Assignment hints** — unannotated variable assignments, including `self.attr` in `__init__`
+- **Return hints** — unannotated `def` and `async def` functions, inferred from the first `return` statement
+- **Raise hints** — `raise ExceptionType(...)` statements
+- **Parameter hints** — positional argument names at call sites (keyword args are skipped as self-documenting)
+
+Inlay hints respect type annotations already present in the source — annotated functions and
+variables are never hinted twice.
+
+## 🔍 How it works
+
+### Workspace symbols
+
+`pylsp` does not define a `pylsp_workspace_symbols` hookspec, so this plugin uses two hooks:
 
 1. **`pylsp_experimental_capabilities`** — advertises `workspaceSymbolProvider: true` to the client during the `initialize` handshake.
-2. **`pylsp_dispatchers`** — registers a custom JSON-RPC handler for `workspace/symbol` that calls Jedi's `project.complete_search("")` and filters results client-side by case-insensitive substring match.
+2. **`pylsp_dispatchers`** — registers a custom JSON-RPC handler for `workspace/symbol` that calls Jedi's `project.complete_search()` and filters results client-side by case-insensitive substring match.
 
 > **Note:** `workspace/symbol` returns module-level definitions (functions, classes, modules).
 > Local variables inside functions are not indexed — this is standard LSP behaviour,
 > consistent with pyright and other Python language servers.
+
+### Inlay hints
+
+The plugin handles the `textDocument/inlayHint` request using a hybrid approach:
+
+1. **Regex scan** — fast pass over the source to locate `def`, assignment, `raise`, and call patterns.
+2. **`_literal_type` fast-path** — resolves common literals (`"str"`, `42`, `True`, `[...]`, etc.) without calling Jedi.
+3. **Jedi inference** — for non-literal expressions, `script.infer()` and `script.get_signatures()` are used to resolve types.
+4. **Signature fallback** — for `self.attr = param` assignments, the enclosing `def` signature is inspected for type annotations or default values.
 
 ## 🧪 Tests
 
@@ -91,6 +139,7 @@ Please open an issue before submitting a large change.
 - [python-lsp-server](https://github.com/python-lsp/python-lsp-server)
 - [Jedi](https://github.com/davidhalter/jedi)
 - [LSP workspace/symbol specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_symbol)
+- [LSP inlay hints specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_inlayHint)
 
 ## 👤 Author
 
