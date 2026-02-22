@@ -109,7 +109,8 @@ class TestExperimentalCapabilities:
         cfg = _make_config(_make_settings(enabled=True))
         ws = _make_workspace()
         result = pylsp_experimental_capabilities(cfg, ws)
-        assert result == {"workspaceSymbolProvider": True}
+        assert result["workspaceSymbolProvider"] is True
+        assert "inlayHintProvider" in result
 
     def test_empty_when_disabled(self):
         cfg = _make_config(_make_settings(enabled=False))
