@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pylsp-workspace-symbols"
-version = "0.1.0"
-description = "workspace/symbol support for python-lsp-server via Jedi"
+version = "0.2.0"
+description = "Workspace/symbol search and inlay hints for python-lsp-server via Jedi"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
-keywords = ["pylsp", "python-lsp-server", "lsp", "jedi", "workspace-symbols"]
+keywords = ["pylsp", "python-lsp-server", "lsp", "jedi", "workspace-symbols", "inlay-hints"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
