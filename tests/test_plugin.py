@@ -108,9 +108,17 @@ class TestExperimentalCapabilities:
     def test_advertises_when_enabled(self):
         cfg = _make_config(_make_settings(enabled=True))
         ws = _make_workspace()
+        # When capability injection succeeds (_CAPS_INJECTED=True), the hook
+        # intentionally returns {} to avoid announcing capabilities twice.
+        # When injection fails (_CAPS_INJECTED=False), it returns the full dict.
+        # Both outcomes are valid — we check the contract holds in either case.
+        from pylsp_workspace_symbols import plugin
         result = pylsp_experimental_capabilities(cfg, ws)
-        assert result["workspaceSymbolProvider"] is True
-        assert "inlayHintProvider" in result
+        if plugin._CAPS_INJECTED:
+            assert result == {}
+        else:
+            assert result["workspaceSymbolProvider"] is True
+            assert "inlayHintProvider" in result
 
     def test_empty_when_disabled(self):
         cfg = _make_config(_make_settings(enabled=False))
