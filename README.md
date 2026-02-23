@@ -8,7 +8,7 @@
 
 A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace/symbol search** and **inlay hints** via [Jedi](https://github.com/davidhalter/jedi).
 
-> **Why?** `pylsp` does not implement `workspace/symbol` natively, and its inlay hints support is limited. This plugin fills both gaps, enabling "Go to Symbol in Workspace" and rich type inference hints in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others.
+> **Why?** `pylsp` does not implement `workspace/symbol` natively, and its inlay hints support is limited. This plugin fills both gaps, enabling "Go to Symbol in Workspace" and rich type inference hints in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others — with broad client compatibility out of the box.
 
 ---
 
@@ -16,6 +16,7 @@ A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin th
 
 - 🔍 **Workspace-wide symbol search** — find functions, classes, and modules across all files in the project
 - 💡 **Inlay hints** — inline type annotations inferred by Jedi for assignments, return types, raised exceptions, and parameter names at call sites
+- 🔌 **Broad client compatibility** — capabilities announced via proper LSP channel (works with Neovim, eglot, and any client that does not support experimental capabilities), with automatic fallback to the experimental channel
 - ⚡ **Fast** — results in ~130ms after the first call (Jedi cache warm)
 - 🔤 **Case-insensitive substring match** — `area` finds `calculate_area`, `Cal` finds `Calculator`
 - 📁 **Smart folder exclusion** — automatically skips `.git`, `__pycache__`, `node_modules`, `.venv`, `dist`, `build`, and more
@@ -104,10 +105,11 @@ variables are never hinted twice.
 
 ### Workspace symbols
 
-`pylsp` does not define a `pylsp_workspace_symbols` hookspec, so this plugin uses two hooks:
+`pylsp` does not define a `pylsp_workspace_symbols` hookspec, so this plugin uses a two-pronged approach:
 
-1. **`pylsp_experimental_capabilities`** — advertises `workspaceSymbolProvider: true` to the client during the `initialize` handshake.
-2. **`pylsp_dispatchers`** — registers a custom JSON-RPC handler for `workspace/symbol` that calls Jedi's `project.complete_search()` and filters results client-side by case-insensitive substring match.
+1. **Capability injection (preferred)** — at import time, monkey-patches `PythonLSPServer.capabilities()` to insert `workspaceSymbolProvider: true` and `inlayHintProvider` directly into the proper LSP capabilities dict. This makes the plugin work out-of-the-box with clients that require proper capabilities, such as Neovim and eglot.
+2. **Experimental fallback** — if the injection fails (e.g. pylsp changes its internal API), capabilities are announced via `pylsp_experimental_capabilities` instead. Clients that honour the experimental channel (CudaText, VSCode with pylsp, etc.) will still work.
+3. **`pylsp_dispatchers`** — registers a custom JSON-RPC handler for `workspace/symbol` that calls Jedi's `project.complete_search()` and filters results client-side by case-insensitive substring match.
 
 > **Note:** `workspace/symbol` returns module-level definitions (functions, classes, modules).
 > Local variables inside functions are not indexed — this is standard LSP behaviour,
