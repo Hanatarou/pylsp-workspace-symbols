@@ -1,12 +1,22 @@
-"""pylsp-workspace-symbols: workspace/symbol support for python-lsp-server via Jedi and inlay hints.
+"""pylsp-workspace-symbols: workspace/symbol support and inlay hints for python-lsp-server via Jedi.
 
-Strategy: pylsp's hookspecs.py does not define a pylsp_workspace_symbols hookspec,
-so we cannot add the capability via the normal hook mechanism.  Instead we:
+Strategy: pylsp's hookspecs.py does not define hookspecs for workspace symbols or
+inlay hints as proper capabilities, so this plugin uses a two-pronged approach:
 
-  1. Announce the capability via pylsp_experimental_capabilities (so the client
-     sees workspaceSymbolProvider: True in the server capabilities).
-  2. Register a custom JSON-RPC dispatcher via pylsp_dispatchers that intercepts
-     the "workspace/symbol" method and calls our Jedi-backed implementation.
+  1. Capability injection (preferred): at import time, monkey-patch
+     PythonLSPServer.capabilities() to insert workspaceSymbolProvider and
+     inlayHintProvider directly into the proper capabilities dict.
+     This makes the plugin work out-of-the-box with clients that require
+     proper capabilities (eglot, Neovim, etc.).
+
+  2. Fallback via pylsp_experimental_capabilities: if the injection fails
+     (e.g. pylsp changed its internal API), the capabilities are announced
+     via the experimental channel instead. Clients that honour experimental
+     capabilities (CudaText, VSCode with pylsp, etc.) will still work.
+
+  3. Register a custom JSON-RPC dispatcher via pylsp_dispatchers that intercepts
+     the "workspace/symbol" and "textDocument/inlayHint" methods and calls
+     our Jedi-backed implementations.
 """
 from __future__ import annotations
 import logging
@@ -29,6 +39,54 @@ if HAS_INLAY_DEPS:
     log.info("pylsp_workspace_symbols: Jedi available for inlay hints (Jedi-only mode)")
 else:
     log.warning("pylsp_workspace_symbols: Jedi not available - inlay hints disabled")
+
+# ---------------------------------------------------------------------------
+# Capability injection (monkey-patch)
+# ---------------------------------------------------------------------------
+# pylsp has no hookspec for proper capabilities, so we attempt to inject
+# inlayHintProvider and workspaceSymbolProvider directly into
+# PythonLSPServer.capabilities() at import time.
+#
+# Fallback: if the injection fails (pylsp internal API changed), the plugin
+# continues to work via pylsp_experimental_capabilities below - clients that
+# honour experimental capabilities will still receive the providers.
+# ---------------------------------------------------------------------------
+
+def _inject_capabilities() -> bool:
+    """Inject inlayHintProvider and workspaceSymbolProvider into pylsp's
+    server capabilities via monkey-patching.
+
+    Returns True if injection succeeded, False otherwise.
+    The caller must not raise on False - the experimental hook is the fallback.
+    """
+    try:
+        from pylsp import python_lsp
+        _original = python_lsp.PythonLSPServer.capabilities
+
+        def _patched(self):
+            caps = _original(self)
+            caps.setdefault("workspaceSymbolProvider", True)
+            caps.setdefault("inlayHintProvider", {
+                "resolveProvider": False,
+                "workDoneProgress": True,
+            })
+            return caps
+
+        python_lsp.PythonLSPServer.capabilities = _patched
+        log.info("pylsp_workspace_symbols: capabilities injected into PythonLSPServer")
+        return True
+    except Exception as e:  # pragma: no cover
+        log.warning(
+            "pylsp_workspace_symbols: capability injection failed (%s) "
+            "- falling back to pylsp_experimental_capabilities",
+            e,
+        )
+        return False
+
+
+# True -> proper capabilities announced (eglot, Neovim, etc. work out of the box)
+# False -> fallback to pylsp_experimental_capabilities (CudaText, VSCode, etc.)
+_CAPS_INJECTED = _inject_capabilities()
 
 # Jedi name type -> LSP SymbolKind (1-based, per LSP spec)
 _SYMBOL_KIND: Dict[str, int] = {
@@ -82,7 +140,15 @@ def pylsp_settings(config) -> dict:
 
 @hookimpl
 def pylsp_experimental_capabilities(config, workspace) -> dict:
-    """Advertise workspaceSymbolProvider and inlayHintProvider capability to the client."""
+    """Advertise workspaceSymbolProvider and inlayHintProvider as fallback.
+
+    Only used when direct capability injection into PythonLSPServer failed.
+    If _CAPS_INJECTED is True, capabilities are already in the proper channel
+    and this hook returns an empty dict to avoid announcing them twice.
+    """
+    if _CAPS_INJECTED:
+        return {}
+
     settings_ws = config.plugin_settings("jedi_workspace_symbols")
     settings_ih = config.plugin_settings("inlay_hints")
 
@@ -95,9 +161,12 @@ def pylsp_experimental_capabilities(config, workspace) -> dict:
             "resolveProvider": False,
             "workDoneProgress": True,
         }
-        log.info("pylsp_workspace_symbols: announcing inlayHintProvider capability")
+        log.info("pylsp_workspace_symbols: announcing inlayHintProvider via experimental fallback")
     else:
-        log.warning("pylsp_workspace_symbols: inlayHintProvider not announced (HAS_INLAY_DEPS=%s)", HAS_INLAY_DEPS)
+        log.warning(
+            "pylsp_workspace_symbols: inlayHintProvider not announced "
+            "(HAS_INLAY_DEPS=%s)", HAS_INLAY_DEPS
+        )
     return caps
 
 
