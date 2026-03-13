@@ -6,9 +6,9 @@
 [![Downloads](https://img.shields.io/pypi/dm/pylsp-workspace-symbols)](https://pypistats.org/packages/pylsp-workspace-symbols)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hanatarou/pylsp-workspace-symbols/blob/main/LICENSE)
 
-A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace/symbol search** and **inlay hints** via [Jedi](https://github.com/davidhalter/jedi).
+A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace symbol search**, **inlay hints**, **call/type hierarchy**, **document links** and **document colors** via [Jedi](https://github.com/davidhalter/jedi).
 
-> **Why?** `pylsp` does not implement `workspace/symbol` natively, and its inlay hints support is limited. This plugin fills both gaps, enabling "Go to Symbol in Workspace" and rich type inference hints in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others — with broad client compatibility out of the box.
+> **Why?** `pylsp` does not implement several LSP features natively. This plugin fills those gaps — enabling "Go to Symbol in Workspace", rich type inference hints, call/type hierarchy navigation, clickable import links, and inline color previews in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others — with broad client compatibility out of the box.
 
 ---
 
@@ -16,6 +16,10 @@ A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin th
 
 - 🔍 **Workspace-wide symbol search** — find functions, classes, and modules across all files in the project
 - 💡 **Inlay hints** — inline type annotations inferred by Jedi for assignments, return types, raised exceptions, and parameter names at call sites
+- 🌳 **Call hierarchy** — navigate callers and callees of any function via `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`
+- 🧬 **Type hierarchy** — explore supertypes and subtypes of any class via `typeHierarchy/supertypes` and `typeHierarchy/subtypes`
+- 🔗 **Document links** — clickable links for URLs in comments/strings and import statements (resolves to stdlib source when available)
+- 🎨 **Document colors** — inline color previews for CSS/hex/RGB/HSL color literals in source files
 - 🔌 **Broad client compatibility** — capabilities announced via proper LSP channel (works with Neovim, eglot, and any client that does not support experimental capabilities), with automatic fallback to the experimental channel
 - ⚡ **Fast** — results in ~130ms after the first call (Jedi cache warm)
 - 🔤 **Case-insensitive substring match** — `area` finds `calculate_area`, `Cal` finds `Calculator`
@@ -51,6 +55,18 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
         "show_raises": true,
         "show_parameter_hints": true,
         "max_hints_per_file": 200
+      },
+      "call_hierarchy": {
+        "enabled": true
+      },
+      "type_hierarchy": {
+        "enabled": true
+      },
+      "document_links": {
+        "enabled": true
+      },
+      "document_colors": {
+        "enabled": true
       }
     }
   }
@@ -75,6 +91,30 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
 | `show_raises` | bool | `true` | Show raised exception types (`raise ValueError(...)` → `Raises: ValueError`) |
 | `show_parameter_hints` | bool | `true` | Show parameter names at call sites (`f(1, 2)` → `a=1, b=2`) |
 | `max_hints_per_file` | int | `200` | Maximum hints per file. `0` means no limit |
+
+### Call hierarchy options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable call hierarchy (`callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`) |
+
+### Type hierarchy options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable type hierarchy (`typeHierarchy/supertypes`, `typeHierarchy/subtypes`) |
+
+### Document links options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable document links (URLs in comments/strings and import resolution) |
+
+### Document colors options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable document color previews (hex, RGB, HSL, CSS named colors) |
 
 ### Built-in ignored folders
 
@@ -101,6 +141,30 @@ rendered inline by the client automatically. The following hint types are suppor
 Inlay hints respect type annotations already present in the source — annotated functions and
 variables are never hinted twice.
 
+### Call hierarchy
+
+Your LSP client will receive `callHierarchyProvider: true`. Place the cursor on any function name
+and invoke "Show Call Hierarchy" to see incoming callers and outgoing callees. Supported servers:
+rust-analyzer, clangd, and any server that uses standard `callHierarchy/*` requests.
+
+### Type hierarchy
+
+Your LSP client will receive `typeHierarchyProvider: true`. Place the cursor on any class name
+and invoke "Show Type Hierarchy" to explore supertypes and subtypes. Supported servers:
+rust-analyzer, clangd, and any server that uses standard `typeHierarchy/*` requests.
+
+### Document links
+
+Your LSP client will receive `documentLinkProvider: true`. URLs in comments and strings become
+clickable links. Import statements are resolved to the corresponding source file in the system
+Python's `Lib/` directory (when Python is installed and available on PATH). Modules without a
+`.py` source (C extensions, frozen modules, embedded-only `.pyc`) are silently skipped.
+
+### Document colors
+
+Your LSP client will receive `colorProvider: true`. Inline color swatches are shown for:
+hex (`#rgb`, `#rrggbb`, `#rrggbbaa`), `rgb()`/`rgba()`, `hsl()`/`hsla()`, and CSS named colors.
+
 ## 🔍 How it works
 
 ### Workspace symbols
@@ -124,6 +188,27 @@ The plugin handles the `textDocument/inlayHint` request using a hybrid approach:
 3. **Jedi inference** — for non-literal expressions, `script.infer()` and `script.get_signatures()` are used to resolve types.
 4. **Signature fallback** — for `self.attr = param` assignments, the enclosing `def` signature is inspected for type annotations or default values.
 
+### Call hierarchy
+
+Handled via `callHierarchy/prepare`, `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls` dispatchers. Uses Jedi's `script.goto()` and `script.get_references()` to resolve callers and callees, building LSP-compliant `CallHierarchyItem` structures with correct range information.
+
+### Type hierarchy
+
+Handled via `typeHierarchy/prepare`, `typeHierarchy/supertypes` and `typeHierarchy/subtypes` dispatchers. Uses Jedi's `script.goto()` and class MRO inspection to build the type tree, restricted to an allowlist of servers known to support the feature correctly (rust-analyzer, clangd, etc.).
+
+### Document links
+
+Two-pass collection over the source:
+
+1. **URL pass** — regex scan for `http://` and `https://` URLs in comments, docstrings, and string literals.
+2. **Import pass** — AST parse to find all `import` and `from ... import` statements; resolves each module name to a `.py` file by querying the system Python's `sys.prefix` via a single cached subprocess call.
+
+Modules without a `.py` source (C extensions, frozen modules, `.pyc`-only embedded builds) are silently skipped.
+
+### Document colors
+
+Regex-based scan over the source for color literals: hex (`#rgb`, `#rrggbb`, `#rrggbbaa`), `rgb()`/`rgba()`, `hsl()`/`hsla()`, and the full set of CSS named colors. Each match is returned as an LSP `ColorInformation` with normalised `[0.0, 1.0]` RGBA components.
+
 ## 🧪 Tests
 
 ```bash
@@ -142,6 +227,10 @@ Please open an issue before submitting a large change.
 - [Jedi](https://github.com/davidhalter/jedi)
 - [LSP workspace/symbol specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_symbol)
 - [LSP inlay hints specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_inlayHint)
+- [LSP call hierarchy specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareCallHierarchy)
+- [LSP type hierarchy specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareTypeHierarchy)
+- [LSP document links specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_documentLink)
+- [LSP document colors specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_documentColor)
 
 ## 👤 Author
 
