@@ -70,6 +70,10 @@ def _inject_capabilities() -> bool:
                 "resolveProvider": False,
                 "workDoneProgress": True,
             })
+            caps.setdefault("callHierarchyProvider", True)
+            caps.setdefault("typeHierarchyProvider", True)
+            caps.setdefault("documentLinkProvider", {"resolveProvider": False})
+            caps.setdefault("colorProvider", True)
             return caps
 
         python_lsp.PythonLSPServer.capabilities = _patched
@@ -134,6 +138,18 @@ def pylsp_settings(config) -> dict:
                 "show_parameter_hints": True,       # show parameter names in function calls
                 "max_hints_per_file": 200,          # maximum hints per file
             },
+            "call_hierarchy": {
+                "enabled": True,
+            },
+            "type_hierarchy": {
+                "enabled": True,
+            },
+            "document_links": {
+                "enabled": True,
+            },
+            "document_colors": {
+                "enabled": True,
+            },
         }
     }
 
@@ -151,6 +167,8 @@ def pylsp_experimental_capabilities(config, workspace) -> dict:
 
     settings_ws = config.plugin_settings("jedi_workspace_symbols")
     settings_ih = config.plugin_settings("inlay_hints")
+    settings_ch = config.plugin_settings("call_hierarchy")
+    settings_th = config.plugin_settings("type_hierarchy")
 
     caps: Dict[str, Any] = {}
     if settings_ws.get("enabled", True):
@@ -167,6 +185,14 @@ def pylsp_experimental_capabilities(config, workspace) -> dict:
             "pylsp_workspace_symbols: inlayHintProvider not announced "
             "(HAS_INLAY_DEPS=%s)", HAS_INLAY_DEPS
         )
+    if settings_ch.get("enabled", True):
+        caps["callHierarchyProvider"] = True
+    if settings_th.get("enabled", True):
+        caps["typeHierarchyProvider"] = True
+    if config.plugin_settings("document_links").get("enabled", True):
+        caps["documentLinkProvider"] = {"resolveProvider": False}
+    if config.plugin_settings("document_colors").get("enabled", True):
+        caps["colorProvider"] = True
     return caps
 
 
@@ -217,6 +243,124 @@ def pylsp_dispatchers(config, workspace) -> dict:
                 return []
 
         dispatch["textDocument/inlayHint"] = _inlay_hint
+
+    # -- Call hierarchy ----------------------------------------------------
+    settings_ch = config.plugin_settings("call_hierarchy")
+    if settings_ch.get("enabled", True) and HAS_INLAY_DEPS:
+        def _prepare_call_hierarchy(params) -> Optional[List[dict]]:
+            if not isinstance(params, dict):
+                return None
+            pos = params.get("position", {})
+            uri = (params.get("textDocument") or {}).get("uri")
+            if not uri:
+                return None
+            try:
+                document = workspace.get_document(uri)
+                return _call_hierarchy_prepare(
+                    document.source, document.path,
+                    pos.get("line", 0), pos.get("character", 0),
+                )
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: prepareCallHierarchy: %s", exc)
+                return None
+
+        def _incoming_calls(params) -> Optional[List[dict]]:
+            if not isinstance(params, dict):
+                return None
+            try:
+                return _call_hierarchy_incoming(params.get("item", {}), workspace)
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: incomingCalls: %s", exc)
+                return None
+
+        def _outgoing_calls(params) -> Optional[List[dict]]:
+            if not isinstance(params, dict):
+                return None
+            try:
+                return _call_hierarchy_outgoing(params.get("item", {}), workspace)
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: outgoingCalls: %s", exc)
+                return None
+
+        dispatch["textDocument/prepareCallHierarchy"] = _prepare_call_hierarchy
+        dispatch["callHierarchy/incomingCalls"] = _incoming_calls
+        dispatch["callHierarchy/outgoingCalls"] = _outgoing_calls
+
+    # -- Type hierarchy ----------------------------------------------------
+    settings_th = config.plugin_settings("type_hierarchy")
+    if settings_th.get("enabled", True) and HAS_INLAY_DEPS:
+        def _prepare_type_hierarchy(params) -> Optional[List[dict]]:
+            if not isinstance(params, dict):
+                return None
+            pos = params.get("position", {})
+            uri = (params.get("textDocument") or {}).get("uri")
+            if not uri:
+                return None
+            try:
+                document = workspace.get_document(uri)
+                return _type_hierarchy_prepare(
+                    document.source, document.path,
+                    pos.get("line", 0), pos.get("character", 0),
+                )
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: prepareTypeHierarchy: %s", exc)
+                return None
+
+        def _supertypes(params) -> Optional[List[dict]]:
+            if not isinstance(params, dict):
+                return None
+            try:
+                return _type_hierarchy_supertypes(params.get("item", {}))
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: supertypes: %s", exc)
+                return None
+
+        def _subtypes(params) -> Optional[List[dict]]:
+            if not isinstance(params, dict):
+                return None
+            try:
+                return _type_hierarchy_subtypes(params.get("item", {}), workspace)
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: subtypes: %s", exc)
+                return None
+
+        dispatch["textDocument/prepareTypeHierarchy"] = _prepare_type_hierarchy
+        dispatch["typeHierarchy/supertypes"] = _supertypes
+        dispatch["typeHierarchy/subtypes"] = _subtypes
+
+    settings_dl = config.plugin_settings("document_links")
+    if settings_dl.get("enabled", True):
+        def _document_link(params) -> List[dict]:
+            if not isinstance(params, dict):
+                return []
+            uri = (params.get("textDocument") or {}).get("uri")
+            if not uri:
+                return []
+            try:
+                document = workspace.get_document(uri)
+                return _collect_document_links(document.source, document.path, workspace)
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: documentLink: %s", exc)
+                return []
+
+        dispatch["textDocument/documentLink"] = _document_link
+
+    settings_dc = config.plugin_settings("document_colors")
+    if settings_dc.get("enabled", True):
+        def _document_color(params) -> List[dict]:
+            if not isinstance(params, dict):
+                return []
+            uri = (params.get("textDocument") or {}).get("uri")
+            if not uri:
+                return []
+            try:
+                document = workspace.get_document(uri)
+                return _collect_document_colors(document.source)
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: documentColor: %s", exc)
+                return []
+
+        dispatch["textDocument/documentColor"] = _document_color
 
     return dispatch
 
@@ -987,3 +1131,1219 @@ def pylsp_document_did_save(config, workspace, document):
     """Clears the cache on save to ensure up-to-date types."""
     with _CACHE_LOCK:
         _JEDI_CACHE.pop(document.path, None)
+
+
+# ---------------------------------------------------------------------------
+# Call Hierarchy - implementation
+# ---------------------------------------------------------------------------
+
+
+def _ch_item_from_name(name: "_jedi.api.classes.Name", path: str = "") -> dict:
+    """Build a CallHierarchyItem / TypeHierarchyItem dict from a Jedi Name."""
+    module_path = str(name.module_path) if name.module_path else path
+    line_0 = (name.line or 1) - 1   # 0-based
+    col = name.column or 0
+    symbol_uri = uris.from_fs_path(module_path) if module_path else ""
+    span = {
+        "start": {"line": line_0, "character": col},
+        "end": {"line": line_0, "character": col + len(name.name)},
+    }
+    return {
+        "name": name.name,
+        "kind": _SYMBOL_KIND.get(name.type, _DEFAULT_KIND),
+        "uri": symbol_uri,
+        "range": span,
+        "selectionRange": span,
+        "data": {
+            "path": module_path,
+            "line": name.line or 1,   # 1-based kept for Jedi round-trips
+            "column": col,
+        },
+    }
+
+
+def _call_hierarchy_prepare(
+    source_code: str, path: str, line: int, character: int
+) -> Optional[List[dict]]:
+    """textDocument/prepareCallHierarchy - resolve the callable under the cursor."""
+    try:
+        script = _jedi.Script(code=source_code, path=path)
+        names = script.goto(line=line + 1, column=character)
+        if not names:
+            names = script.infer(line=line + 1, column=character)
+        if not names or names[0].type not in ("function", "class"):
+            return None
+        return [_ch_item_from_name(names[0], path)]
+    except Exception as exc:
+        log.debug("pylsp_workspace_symbols: _call_hierarchy_prepare: %s", exc)
+        return None
+
+
+def _call_hierarchy_outgoing(item: dict, workspace) -> List[dict]:
+    """callHierarchy/outgoingCalls - all callees inside the item's function body."""
+    import ast as _ast
+
+    data = item.get("data", {})
+    path = data.get("path", "")
+    item_line = data.get("line", 1)   # 1-based
+
+    if not path:
+        return []
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            source = fh.read()
+
+        tree = _ast.parse(source)
+        source_lines = source.splitlines()
+
+        # Locate the function body end
+        func_end = min(item_line + 300, len(source_lines))
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if node.lineno == item_line:
+                    func_end = node.end_lineno
+                    break
+
+        script = _jedi.Script(code=source, path=path)
+        calls: List[dict] = []
+        seen: set = set()
+
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            call_line = node.lineno
+            if not (item_line < call_line <= func_end):
+                continue
+
+            func_node = node.func
+            if isinstance(func_node, _ast.Name):
+                call_col = func_node.col_offset
+            elif isinstance(func_node, _ast.Attribute):
+                call_col = func_node.end_col_offset - len(func_node.attr)
+            else:
+                continue
+
+            try:
+                targets = script.goto(line=call_line, column=call_col)
+                if not targets:
+                    targets = script.infer(line=call_line, column=call_col)
+                if not targets or targets[0].type not in ("function", "class"):
+                    continue
+                target = targets[0]
+                if not target.module_path:
+                    continue
+                key = (str(target.module_path), target.line, target.column)
+                if key in seen:
+                    continue
+                seen.add(key)
+                from_ranges = [{
+                    "start": {"line": call_line - 1, "character": call_col},
+                    "end": {"line": call_line - 1, "character": call_col + len(target.name)},
+                }]
+                calls.append({"to": _ch_item_from_name(target), "fromRanges": from_ranges})
+            except Exception:
+                continue
+
+        return calls
+    except Exception as exc:
+        log.debug("pylsp_workspace_symbols: _call_hierarchy_outgoing: %s", exc)
+        return []
+
+
+def _call_hierarchy_incoming(item: dict, workspace) -> List[dict]:
+    """callHierarchy/incomingCalls - all call sites of the given callable."""
+    data = item.get("data", {})
+    path = data.get("path", "")
+    item_line = data.get("line", 1)
+    item_col = data.get("column", 0)
+
+    if not path:
+        return []
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            source = fh.read()
+
+        root_path = getattr(workspace, "root_path", None)
+        project = _jedi.Project(path=root_path) if root_path else None
+        script = _jedi.Script(code=source, path=path, project=project)
+        refs = script.get_references(
+            line=item_line, column=item_col, include_builtins=False
+        )
+
+        calls: List[dict] = []
+        seen: set = set()
+
+        for ref in refs:
+            if not ref.module_path:
+                continue
+            if _in_ignored_folder(str(ref.module_path), _DEFAULT_IGNORE_FOLDERS):
+                continue
+            # Skip the definition line itself
+            if str(ref.module_path) == path and ref.line == item_line:
+                continue
+            # Skip import statements - they are not call sites.
+            # ref.type is unreliable for this; use AST on the source line instead.
+            try:
+                import ast as _ast_chk
+                ref_src_lines = open(str(ref.module_path), encoding="utf-8", errors="replace").read().splitlines()
+                ref_src_line = ref_src_lines[(ref.line or 1) - 1] if ref.line else ""
+                _node = _ast_chk.parse(ref_src_line.strip(), mode="single")
+                if any(isinstance(n, (_ast_chk.Import, _ast_chk.ImportFrom))
+                       for n in _ast_chk.walk(_node)):
+                    continue
+            except Exception:
+                pass
+
+            ref_path = str(ref.module_path)
+            ref_line = ref.line or 1
+            ref_col = ref.column or 0
+            key = (ref_path, ref_line, ref_col)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # Resolve the enclosing caller
+            try:
+                with open(ref_path, encoding="utf-8", errors="replace") as fh:
+                    ref_source = fh.read()
+                ref_script = _jedi.Script(code=ref_source, path=ref_path)
+                ctx = ref_script.get_context(line=ref_line, column=ref_col)
+                if ctx and ctx.type in ("function", "class") and ctx.module_path:
+                    from_item = _ch_item_from_name(ctx)
+                else:
+                    # Fallback: treat the reference as coming from module scope
+                    from_item = {
+                        "name": ref.module_name or "module",
+                        "kind": 2,  # Module
+                        "uri": uris.from_fs_path(ref_path),
+                        "range": {
+                            "start": {"line": ref_line - 1, "character": 0},
+                            "end": {"line": ref_line - 1, "character": 0},
+                        },
+                        "selectionRange": {
+                            "start": {"line": ref_line - 1, "character": 0},
+                            "end": {"line": ref_line - 1, "character": 0},
+                        },
+                        "data": {"path": ref_path, "line": ref_line, "column": 0},
+                    }
+            except Exception:
+                continue
+
+            from_ranges = [{
+                "start": {"line": ref_line - 1, "character": ref_col},
+                "end": {
+                    "line": ref_line - 1,
+                    "character": ref_col + len(item.get("name", "")),
+                },
+            }]
+            calls.append({"from": from_item, "fromRanges": from_ranges})
+
+        return calls
+    except Exception as exc:
+        log.debug("pylsp_workspace_symbols: _call_hierarchy_incoming: %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Type Hierarchy - implementation
+# ---------------------------------------------------------------------------
+
+
+def _type_hierarchy_prepare(
+    source_code: str, path: str, line: int, character: int
+) -> Optional[List[dict]]:
+    """textDocument/prepareTypeHierarchy - resolve the class under the cursor."""
+    try:
+        script = _jedi.Script(code=source_code, path=path)
+        names = script.goto(line=line + 1, column=character)
+        if not names:
+            names = script.infer(line=line + 1, column=character)
+        if not names or names[0].type != "class":
+            return None
+        return [_ch_item_from_name(names[0], path)]
+    except Exception as exc:
+        log.debug("pylsp_workspace_symbols: _type_hierarchy_prepare: %s", exc)
+        return None
+
+
+def _type_hierarchy_supertypes(item: dict) -> List[dict]:
+    """typeHierarchy/supertypes - direct parent classes of the given class."""
+    import ast as _ast
+
+    data = item.get("data", {})
+    path = data.get("path", "")
+    item_line = data.get("line", 1)
+
+    if not path:
+        return []
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            source = fh.read()
+
+        tree = _ast.parse(source)
+        script = _jedi.Script(code=source, path=path)
+        supertypes: List[dict] = []
+        seen: set = set()
+
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.ClassDef) or node.lineno != item_line:
+                continue
+            for base in node.bases:
+                if isinstance(base, _ast.Name):
+                    base_col = base.col_offset
+                elif isinstance(base, _ast.Attribute):
+                    base_col = base.end_col_offset - len(base.attr)
+                else:
+                    continue
+                try:
+                    targets = script.goto(line=base.lineno, column=base_col)
+                    if not targets:
+                        targets = script.infer(line=base.lineno, column=base_col)
+                    if not targets or targets[0].type != "class":
+                        continue
+                    t = targets[0]
+                    if not t.module_path:
+                        continue
+                    key = (str(t.module_path), t.line)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    supertypes.append(_ch_item_from_name(t))
+                except Exception:
+                    continue
+            break  # only the matching ClassDef
+
+        return supertypes
+    except Exception as exc:
+        log.debug("pylsp_workspace_symbols: _type_hierarchy_supertypes: %s", exc)
+        return []
+
+
+def _type_hierarchy_subtypes(item: dict, workspace) -> List[dict]:
+    """typeHierarchy/subtypes - classes that inherit from the given class."""
+    import ast as _ast
+
+    data = item.get("data", {})
+    path = data.get("path", "")
+    item_line = data.get("line", 1)
+    item_col = data.get("column", 0)
+    class_name = item.get("name", "")
+
+    if not path or not class_name:
+        return []
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            source = fh.read()
+
+        root_path = getattr(workspace, "root_path", None)
+        project = _jedi.Project(path=root_path) if root_path else None
+        script = _jedi.Script(code=source, path=path, project=project)
+        refs = script.get_references(
+            line=item_line, column=item_col, include_builtins=False
+        )
+
+        subtypes: List[dict] = []
+        seen: set = set()
+
+        for ref in refs:
+            if not ref.module_path:
+                continue
+            if _in_ignored_folder(str(ref.module_path), _DEFAULT_IGNORE_FOLDERS):
+                continue
+            if str(ref.module_path) == path and ref.line == item_line:
+                continue
+
+            ref_path = str(ref.module_path)
+            ref_line = ref.line or 1
+
+            try:
+                with open(ref_path, encoding="utf-8", errors="replace") as fh:
+                    ref_src = fh.read()
+                ref_tree = _ast.parse(ref_src)
+
+                for node in _ast.walk(ref_tree):
+                    if not isinstance(node, _ast.ClassDef):
+                        continue
+                    # Check whether any base expression falls on this ref line
+                    if not any(b.lineno == ref_line for b in node.bases):
+                        continue
+                    key = (ref_path, node.lineno)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    # Resolve the subclass name via Jedi for rich data
+                    try:
+                        rs = _jedi.Script(code=ref_src, path=ref_path)
+                        targets = rs.goto(
+                            line=node.lineno,
+                            column=node.col_offset + len("class "),
+                        )
+                        if not targets:
+                            targets = rs.infer(
+                                line=node.lineno,
+                                column=node.col_offset + len("class "),
+                            )
+                        if targets and targets[0].type == "class":
+                            subtypes.append(_ch_item_from_name(targets[0]))
+                            continue
+                    except Exception:
+                        pass
+
+                    # Fallback: build item from AST node directly
+                    sub_line_0 = node.lineno - 1
+                    sub_col = node.col_offset
+                    span = {
+                        "start": {"line": sub_line_0, "character": sub_col},
+                        "end": {"line": sub_line_0, "character": sub_col + len(node.name)},
+                    }
+                    subtypes.append({
+                        "name": node.name,
+                        "kind": 5,  # Class
+                        "uri": uris.from_fs_path(ref_path),
+                        "range": span,
+                        "selectionRange": span,
+                        "data": {
+                            "path": ref_path,
+                            "line": node.lineno,
+                            "column": sub_col,
+                        },
+                    })
+            except Exception:
+                continue
+
+        return subtypes
+    except Exception as exc:
+        log.debug("pylsp_workspace_symbols: _type_hierarchy_subtypes: %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Document Links - implementation
+# ---------------------------------------------------------------------------
+
+def _collect_document_links(source: str, path: str, workspace) -> List[dict]:
+    """textDocument/documentLink - find clickable references in Python source.
+
+    Passes (in order):
+      1. URLs (http/https) in ``#`` comments, docstrings, and string literals.
+      2. Import statements resolved to local ``.py`` files or ``__init__.py``
+         packages, with Jedi fallback for stdlib and third-party modules.
+      3. String literals that look like file-system paths.
+      4. ``open()`` / ``Path()`` / ``pathlib.Path()`` call arguments.
+    """
+    import ast as _ast
+    import os
+    import re
+
+    results: List[dict] = []
+    seen: set = set()
+    base_dir = os.path.dirname(path) if path else ""
+    root_path = getattr(workspace, "root_path", None) or base_dir
+    lines = source.splitlines()
+
+    def _add_link(line_0: int, col_start: int, col_end: int, target: str) -> None:
+        key = (line_0, col_start)
+        if key in seen:
+            return
+        seen.add(key)
+        results.append({
+            "range": {
+                "start": {"line": line_0, "character": col_start},
+                "end":   {"line": line_0, "character": col_end},
+            },
+            "target": target,
+        })
+
+    def _resolve_path(raw: str) -> Optional[str]:
+        """Resolve a raw string to a file URI if the file exists on disk."""
+        if not raw or len(raw) > 260:
+            return None
+        if os.path.isabs(raw):
+            return uris.from_fs_path(raw) if os.path.exists(raw) else None
+        candidate = os.path.normpath(os.path.join(base_dir, raw))
+        if os.path.exists(candidate):
+            return uris.from_fs_path(candidate)
+        candidate2 = os.path.normpath(os.path.join(root_path, raw))
+        if os.path.exists(candidate2):
+            return uris.from_fs_path(candidate2)
+        return None
+
+    # ------------------------------------------------------------------ #
+    # 1. URLs in comments, docstrings, and string literals
+    # ------------------------------------------------------------------ #
+    # Matches http:// and https:// URLs, stopping at whitespace or
+    # common trailing punctuation that is unlikely to be part of the URL
+    # (closing quotes, parens, brackets, angle-brackets, comma, period at
+    # end-of-sentence).  The URL itself is captured in group 1.
+    _URL_RE = re.compile(
+        r"""https?://[^\s'"<>()\[\]]+""",
+        re.IGNORECASE,
+    )
+
+    # Pre-compute triple-string spans so we can tell whether a given
+    # position is inside a docstring / multi-line string.
+    triple_spans = _find_triple_string_spans(source)
+
+    # Build a char-offset -> line/col mapping for the URL scanner which
+    # operates on the raw source rather than line-by-line.
+    _line_offsets: List[int] = []  # _line_offsets[i] = char offset of line i
+    _off = 0
+    for _ln in source.splitlines(keepends=True):
+        _line_offsets.append(_off)
+        _off += len(_ln)
+
+    def _offset_to_linecol(offset: int):
+        """Binary-search line_offsets to convert a source char offset to (line, col)."""
+        lo, hi = 0, len(_line_offsets) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _line_offsets[mid] <= offset:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo, offset - _line_offsets[lo]
+
+    def _in_comment_or_string(offset: int) -> bool:
+        """Return True if *offset* is inside a comment or any string literal."""
+        # Inside a triple-quoted string?
+        if any(ts <= offset < te for ts, te in triple_spans):
+            return True
+        # Walk the source up to *offset* tracking single-line quote and
+        # comment state to handle regular strings and inline comments.
+        line_no, col = _offset_to_linecol(offset)
+        line_start = _line_offsets[line_no]
+        seg = source[line_start:line_start + col]
+        in_s, in_d = False, False
+        for ch in seg:
+            if ch == "'" and not in_d:
+                in_s = not in_s
+            elif ch == '"' and not in_s:
+                in_d = not in_d
+            elif ch == "#" and not in_s and not in_d:
+                return True   # rest of line is a comment
+        return in_s or in_d
+
+    for m in _URL_RE.finditer(source):
+        url = m.group(0)
+        # Strip trailing punctuation characters that are commonly appended
+        # after URLs in prose (e.g. "see https://example.com.")
+        url = url.rstrip(".,;:!?)>]\"'")
+        if not url:
+            continue
+        start_off = m.start()
+        if not _in_comment_or_string(start_off):
+            continue  # only emit URLs that appear in comments or strings
+        line_no, col = _offset_to_linecol(start_off)
+        _add_link(line_no, col, col + len(url), url)
+
+    # ------------------------------------------------------------------ #
+    # 2. Import statements -> local .py / __init__.py / Jedi fallback
+    # ------------------------------------------------------------------ #
+    def _resolve_module(mod_name: str) -> Optional[str]:
+        """Return a file URI for *mod_name*.
+
+        Strategy:
+          (a) Local workspace: foo/bar.py or foo/bar/__init__.py
+          (b) System Python stdlib: ask the system Python (via shutil.which)
+              for its prefix, then search Lib/ there. This works even when
+              the plugin itself runs under an embedded Python that only has
+              .pyc files in a zip.
+          (c) Current interpreter find_spec: handles cases where the plugin
+              runs under a full Python installation.
+        """
+        import sys as _sys
+        import shutil as _shutil
+        import subprocess as _sp
+
+        parts = mod_name.split(".")
+
+        # (a) local workspace
+        t = _resolve_path(os.path.join(*parts) + ".py")
+        if t:
+            return t
+        t = _resolve_path(os.path.join(*parts, "__init__.py"))
+        if t:
+            return t
+
+        # (b) system Python stdlib - ask the system python for its prefix.
+        #     Cached at function level so we only run the subprocess once.
+        if not hasattr(_resolve_module, "_sys_lib_dirs"):
+            _resolve_module._sys_lib_dirs = []
+            for exe_name in ("python3", "python"):
+                exe = _shutil.which(exe_name)
+                if not exe:
+                    continue
+                try:
+                    # Single subprocess: get prefix, exec_prefix and version together
+                    result = _sp.run(
+                        [exe, "-c",
+                         "import sys, json; "
+                         "print(json.dumps({"
+                         "'prefixes': [sys.prefix, sys.exec_prefix],"
+                         "'version': sys.version[:4]"
+                         "}))"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.returncode != 0:
+                        continue
+                    import json as _json
+                    data = _json.loads(result.stdout.strip())
+                    sys_ver = data.get("version", "")
+                    seen_prefixes: set = set()
+                    for prefix in data.get("prefixes", []):
+                        if prefix in seen_prefixes:
+                            continue
+                        seen_prefixes.add(prefix)
+                        candidates = [
+                            "Lib",  # Windows
+                            "lib",  # Linux/macOS fallback
+                        ]
+                        if sys_ver:
+                            # e.g. lib/python3.14 (Linux/macOS)
+                            candidates.append(os.path.join("lib", "python" + sys_ver))
+                        for lib_name in candidates:
+                            lib_dir = os.path.normcase(os.path.join(prefix, lib_name))
+                            if os.path.isdir(lib_dir) and lib_dir not in _resolve_module._sys_lib_dirs:
+                                _resolve_module._sys_lib_dirs.append(lib_dir)
+                    if _resolve_module._sys_lib_dirs:
+                        break  # found a usable Python, stop
+                except Exception:
+                    continue
+
+        for lib_dir in _resolve_module._sys_lib_dirs:
+            candidate = os.path.join(lib_dir, *parts) + ".py"
+            if os.path.isfile(candidate):
+                return uris.from_fs_path(candidate)
+            candidate2 = os.path.join(lib_dir, *parts, "__init__.py")
+            if os.path.isfile(candidate2):
+                return uris.from_fs_path(candidate2)
+
+        # (c) current interpreter find_spec - works when running under a full
+        #     Python installation (not embedded).
+        try:
+            import importlib.util as _ilu
+            spec = _ilu.find_spec(mod_name)
+            if spec is not None:
+                origin = spec.origin
+                if origin and origin.endswith(".py") and os.path.isfile(origin):
+                    return uris.from_fs_path(origin)
+                locs = list(spec.submodule_search_locations or [])
+                for loc in locs:
+                    init = os.path.join(loc, "__init__.py")
+                    if os.path.isfile(init):
+                        return uris.from_fs_path(init)
+        except Exception:
+            pass
+
+        return None
+
+    try:
+        tree = _ast.parse(source)
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                for alias in node.names:
+                    target = _resolve_module(alias.name)
+                    if target and node.lineno:
+                        src_line = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
+                        col = src_line.find(alias.name)
+                        if col >= 0:
+                            _add_link(node.lineno - 1, col,
+                                      col + len(alias.name), target)
+            elif isinstance(node, _ast.ImportFrom):
+                if node.module:
+                    target = _resolve_module(node.module)
+                    if target and node.lineno:
+                        src_line = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
+                        col = src_line.find(node.module)
+                        if col >= 0:
+                            _add_link(node.lineno - 1, col,
+                                      col + len(node.module), target)
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------ #
+    # 3. String literals that look like file-system paths
+    # ------------------------------------------------------------------ #
+    _PATH_RE = re.compile(
+        r"""['"]((?:\.{1,2}/|/)[^'"*?\r\n<>|:]{1,255}|[a-zA-Z0-9_\-]+(?:/[a-zA-Z0-9_\-\.]+)+)['"]"""
+    )
+    for line_idx, line_text in enumerate(lines):
+        for m in _PATH_RE.finditer(line_text):
+            raw = m.group(1)
+            target = _resolve_path(raw)
+            if target:
+                col_start = m.start() + 1   # skip opening quote
+                col_end = col_start + len(raw)
+                _add_link(line_idx, col_start, col_end, target)
+
+    # ------------------------------------------------------------------ #
+    # 4. open() / Path() / pathlib.Path() call arguments
+    # ------------------------------------------------------------------ #
+    _CALL_RE = re.compile(
+        r"""\b(?:open|Path|pathlib\.Path)\s*\(\s*['"]([^'"]+)['"]"""
+    )
+    for line_idx, line_text in enumerate(lines):
+        for m in _CALL_RE.finditer(line_text):
+            raw = m.group(1)
+            target = _resolve_path(raw)
+            if target:
+                col_start = m.start(1)
+                col_end = col_start + len(raw)
+                _add_link(line_idx, col_start, col_end, target)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Document Colors - implementation
+# ---------------------------------------------------------------------------
+
+# CSS named colors - full W3C/CSS3 set relevant for Python codebases.
+# Values are (r, g, b, a) in 0.0-1.0 range (alpha always 1.0).
+_CSS_COLORS: Dict[str, tuple] = {
+    "aliceblue": (0.941, 0.973, 1.0, 1.0),
+    "antiquewhite": (0.98, 0.922, 0.843, 1.0),
+    "aqua": (0.0, 1.0, 1.0, 1.0),
+    "aquamarine": (0.498, 1.0, 0.831, 1.0),
+    "azure": (0.941, 1.0, 1.0, 1.0),
+    "beige": (0.961, 0.961, 0.863, 1.0),
+    "bisque": (1.0, 0.894, 0.769, 1.0),
+    "black": (0.0, 0.0, 0.0, 1.0),
+    "blanchedalmond": (1.0, 0.922, 0.804, 1.0),
+    "blue": (0.0, 0.0, 1.0, 1.0),
+    "blueviolet": (0.541, 0.169, 0.886, 1.0),
+    "brown": (0.647, 0.165, 0.165, 1.0),
+    "burlywood": (0.871, 0.722, 0.529, 1.0),
+    "cadetblue": (0.373, 0.620, 0.627, 1.0),
+    "chartreuse": (0.498, 1.0, 0.0, 1.0),
+    "chocolate": (0.824, 0.412, 0.118, 1.0),
+    "coral": (1.0, 0.498, 0.314, 1.0),
+    "cornflowerblue": (0.392, 0.584, 0.929, 1.0),
+    "cornsilk": (1.0, 0.973, 0.863, 1.0),
+    "crimson": (0.863, 0.078, 0.235, 1.0),
+    "cyan": (0.0, 1.0, 1.0, 1.0),
+    "darkblue": (0.0, 0.0, 0.545, 1.0),
+    "darkcyan": (0.0, 0.545, 0.545, 1.0),
+    "darkgoldenrod": (0.722, 0.525, 0.043, 1.0),
+    "darkgray": (0.663, 0.663, 0.663, 1.0),
+    "darkgreen": (0.0, 0.392, 0.0, 1.0),
+    "darkgrey": (0.663, 0.663, 0.663, 1.0),
+    "darkkhaki": (0.741, 0.718, 0.420, 1.0),
+    "darkmagenta": (0.545, 0.0, 0.545, 1.0),
+    "darkolivegreen": (0.333, 0.420, 0.184, 1.0),
+    "darkorange": (1.0, 0.549, 0.0, 1.0),
+    "darkorchid": (0.600, 0.196, 0.800, 1.0),
+    "darkred": (0.545, 0.0, 0.0, 1.0),
+    "darksalmon": (0.914, 0.588, 0.478, 1.0),
+    "darkseagreen": (0.561, 0.737, 0.561, 1.0),
+    "darkslateblue": (0.282, 0.239, 0.545, 1.0),
+    "darkslategray": (0.184, 0.310, 0.310, 1.0),
+    "darkslategrey": (0.184, 0.310, 0.310, 1.0),
+    "darkturquoise": (0.0, 0.808, 0.820, 1.0),
+    "darkviolet": (0.580, 0.0, 0.827, 1.0),
+    "deeppink": (1.0, 0.078, 0.576, 1.0),
+    "deepskyblue": (0.0, 0.749, 1.0, 1.0),
+    "dimgray": (0.412, 0.412, 0.412, 1.0),
+    "dimgrey": (0.412, 0.412, 0.412, 1.0),
+    "dodgerblue": (0.118, 0.565, 1.0, 1.0),
+    "firebrick": (0.698, 0.133, 0.133, 1.0),
+    "floralwhite": (1.0, 0.98, 0.941, 1.0),
+    "forestgreen": (0.133, 0.545, 0.133, 1.0),
+    "fuchsia": (1.0, 0.0, 1.0, 1.0),
+    "gainsboro": (0.863, 0.863, 0.863, 1.0),
+    "ghostwhite": (0.973, 0.973, 1.0, 1.0),
+    "gold": (1.0, 0.843, 0.0, 1.0),
+    "goldenrod": (0.855, 0.647, 0.125, 1.0),
+    "gray": (0.502, 0.502, 0.502, 1.0),
+    "green": (0.0, 0.502, 0.0, 1.0),
+    "greenyellow": (0.678, 1.0, 0.184, 1.0),
+    "grey": (0.502, 0.502, 0.502, 1.0),
+    "honeydew": (0.941, 1.0, 0.941, 1.0),
+    "hotpink": (1.0, 0.412, 0.706, 1.0),
+    "indianred": (0.804, 0.361, 0.361, 1.0),
+    "indigo": (0.294, 0.0, 0.510, 1.0),
+    "ivory": (1.0, 1.0, 0.941, 1.0),
+    "khaki": (0.941, 0.902, 0.549, 1.0),
+    "lavender": (0.902, 0.902, 0.980, 1.0),
+    "lavenderblush": (1.0, 0.941, 0.961, 1.0),
+    "lawngreen": (0.486, 0.988, 0.0, 1.0),
+    "lemonchiffon": (1.0, 0.980, 0.804, 1.0),
+    "lightblue": (0.678, 0.847, 0.902, 1.0),
+    "lightcoral": (0.941, 0.502, 0.502, 1.0),
+    "lightcyan": (0.878, 1.0, 1.0, 1.0),
+    "lightgoldenrodyellow": (0.980, 0.980, 0.824, 1.0),
+    "lightgray": (0.827, 0.827, 0.827, 1.0),
+    "lightgreen": (0.565, 0.933, 0.565, 1.0),
+    "lightgrey": (0.827, 0.827, 0.827, 1.0),
+    "lightpink": (1.0, 0.714, 0.757, 1.0),
+    "lightsalmon": (1.0, 0.627, 0.478, 1.0),
+    "lightseagreen": (0.125, 0.698, 0.667, 1.0),
+    "lightskyblue": (0.529, 0.808, 0.980, 1.0),
+    "lightslategray": (0.467, 0.533, 0.600, 1.0),
+    "lightslategrey": (0.467, 0.533, 0.600, 1.0),
+    "lightsteelblue": (0.690, 0.769, 0.871, 1.0),
+    "lightyellow": (1.0, 1.0, 0.878, 1.0),
+    "lime": (0.0, 1.0, 0.0, 1.0),
+    "limegreen": (0.196, 0.804, 0.196, 1.0),
+    "linen": (0.980, 0.941, 0.902, 1.0),
+    "magenta": (1.0, 0.0, 1.0, 1.0),
+    "maroon": (0.502, 0.0, 0.0, 1.0),
+    "mediumaquamarine": (0.400, 0.804, 0.667, 1.0),
+    "mediumblue": (0.0, 0.0, 0.804, 1.0),
+    "mediumorchid": (0.729, 0.333, 0.827, 1.0),
+    "mediumpurple": (0.576, 0.439, 0.859, 1.0),
+    "mediumseagreen": (0.235, 0.702, 0.443, 1.0),
+    "mediumslateblue": (0.482, 0.408, 0.933, 1.0),
+    "mediumspringgreen": (0.0, 0.980, 0.604, 1.0),
+    "mediumturquoise": (0.282, 0.820, 0.800, 1.0),
+    "mediumvioletred": (0.780, 0.082, 0.522, 1.0),
+    "midnightblue": (0.098, 0.098, 0.439, 1.0),
+    "mintcream": (0.961, 1.0, 0.980, 1.0),
+    "mistyrose": (1.0, 0.894, 0.882, 1.0),
+    "moccasin": (1.0, 0.894, 0.710, 1.0),
+    "navajowhite": (1.0, 0.871, 0.678, 1.0),
+    "navy": (0.0, 0.0, 0.502, 1.0),
+    "oldlace": (0.992, 0.961, 0.902, 1.0),
+    "olive": (0.502, 0.502, 0.0, 1.0),
+    "olivedrab": (0.420, 0.557, 0.137, 1.0),
+    "orange": (1.0, 0.647, 0.0, 1.0),
+    "orangered": (1.0, 0.271, 0.0, 1.0),
+    "orchid": (0.855, 0.439, 0.839, 1.0),
+    "palegoldenrod": (0.933, 0.910, 0.667, 1.0),
+    "palegreen": (0.596, 0.984, 0.596, 1.0),
+    "paleturquoise": (0.686, 0.933, 0.933, 1.0),
+    "palevioletred": (0.859, 0.439, 0.576, 1.0),
+    "papayawhip": (1.0, 0.937, 0.835, 1.0),
+    "peachpuff": (1.0, 0.855, 0.725, 1.0),
+    "peru": (0.804, 0.522, 0.247, 1.0),
+    "pink": (1.0, 0.753, 0.796, 1.0),
+    "plum": (0.867, 0.627, 0.867, 1.0),
+    "powderblue": (0.690, 0.878, 0.902, 1.0),
+    "purple": (0.502, 0.0, 0.502, 1.0),
+    "rebeccapurple": (0.400, 0.200, 0.600, 1.0),
+    "red": (1.0, 0.0, 0.0, 1.0),
+    "rosybrown": (0.737, 0.561, 0.561, 1.0),
+    "royalblue": (0.255, 0.412, 0.882, 1.0),
+    "saddlebrown": (0.545, 0.271, 0.075, 1.0),
+    "salmon": (0.980, 0.502, 0.447, 1.0),
+    "sandybrown": (0.957, 0.643, 0.376, 1.0),
+    "seagreen": (0.180, 0.545, 0.341, 1.0),
+    "seashell": (1.0, 0.961, 0.933, 1.0),
+    "sienna": (0.627, 0.322, 0.176, 1.0),
+    "silver": (0.753, 0.753, 0.753, 1.0),
+    "skyblue": (0.529, 0.808, 0.922, 1.0),
+    "slateblue": (0.416, 0.353, 0.804, 1.0),
+    "slategray": (0.439, 0.502, 0.565, 1.0),
+    "slategrey": (0.439, 0.502, 0.565, 1.0),
+    "snow": (1.0, 0.980, 0.980, 1.0),
+    "springgreen": (0.0, 1.0, 0.498, 1.0),
+    "steelblue": (0.275, 0.510, 0.706, 1.0),
+    "tan": (0.824, 0.706, 0.549, 1.0),
+    "teal": (0.0, 0.502, 0.502, 1.0),
+    "thistle": (0.847, 0.749, 0.847, 1.0),
+    "tomato": (1.0, 0.388, 0.278, 1.0),
+    "turquoise": (0.251, 0.878, 0.816, 1.0),
+    "violet": (0.933, 0.510, 0.933, 1.0),
+    "wheat": (0.961, 0.871, 0.702, 1.0),
+    "white": (1.0, 1.0, 1.0, 1.0),
+    "whitesmoke": (0.961, 0.961, 0.961, 1.0),
+    "yellow": (1.0, 1.0, 0.0, 1.0),
+    "yellowgreen": (0.604, 0.804, 0.196, 1.0),
+}
+
+# Sorted longest-first so multi-word names (e.g. "darkslategray") beat short
+# prefixes (e.g. "dark") in the alternation built from this list.
+_CSS_COLOR_NAMES_SORTED = sorted(_CSS_COLORS.keys(), key=len, reverse=True)
+
+# Single compiled regex that matches any quoted CSS named color.
+# Group 1 captures the name itself (without quotes).
+_NAMED_COLOR_RE = re.compile(
+    r"""['"](""" + "|".join(re.escape(n) for n in _CSS_COLOR_NAMES_SORTED) + r""")['"]""",
+    re.IGNORECASE,
+)
+
+# Hex color regex - two variants kept separate so callers know which context
+# was used for correct column attribution.
+#
+# _HEX_QUOTED_RE  - the safe form: "#rrggbb" or '#rgb' inside Python quotes.
+#   Group 1 = the #-prefixed token; the surrounding quotes are consumed but
+#   not captured so m.start(1) points directly at the '#'.
+#
+# _HEX_BARE_RE    - unquoted form for content inside triple-quoted strings /
+#   CSS/HTML embedded in Python (e.g. `--color: #6200ea;`).
+#   Anchored so '#' is NOT preceded by a word char (avoids CSS id selectors
+#   like `#myId` which start with a letter after #) and IS followed only by
+#   exactly 8, 6, or 3 hex digits with a non-hex-word delimiter after.
+#   Group 1 = the #-prefixed token.
+_HEX_QUOTED_RE = re.compile(
+    r"""['"](#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3}))['"]"""
+)
+_HEX_BARE_RE = re.compile(
+    r"""(?<!['"\\])(#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3}))(?![0-9a-fA-F'"])"""
+)
+
+# rgb() / rgba() functional notation.
+# Accepts both integer (0-255) and percentage (0%-100%) for channels,
+# and integer, float, or percentage for alpha.
+# Group layout: (r_val, g_val, b_val, a_val_or_None)
+_NUM = r"\s*(\d+(?:\.\d*)?%?)\s*"
+_ALPHA = r"(?:[,/]\s*([\d.]+%?)\s*)?"
+_RGB_FUNC_RE = re.compile(
+    r"""\brgba?\s*\(""" + _NUM + r"," + _NUM + r"," + _NUM + _ALPHA + r"""\)""",
+    re.IGNORECASE,
+)
+
+# hsl() / hsla() functional notation.
+# H in degrees (0-360), S and L as percentages, optional alpha.
+_HSL_FUNC_RE = re.compile(
+    r"""\bhsla?\s*\(""" + _NUM + r"," + _NUM + r"," + _NUM + _ALPHA + r"""\)""",
+    re.IGNORECASE,
+)
+
+# Tuple/list integer RGB(A): (255, 102, 0) or (255, 102, 0, 128)
+_TUPLE_RGB_RE = re.compile(
+    r"\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*(\d{1,3}))?\s*\)"
+)
+# Tuple/list float RGB(A): (1.0, 0.4, 0.0) or (1.0, 0.4, 0.0, 0.5)
+_TUPLE_FLOAT_RE = re.compile(
+    r"\(\s*(0?\.\d+|1\.0|[01])\s*,\s*(0?\.\d+|1\.0|[01])\s*,\s*(0?\.\d+|1\.0|[01])\s*"
+    r"(?:,\s*(0?\.\d+|1\.0|[01]))?\s*\)"
+)
+
+# Variable name patterns that suggest a color context - used only for
+# bare tuple detection, not for functional notation or named colors.
+_COLOR_VAR_RE = re.compile(
+    r"\b(colou?rs?|bg|background|fg|foreground|fill|stroke|tint|hue|shade|"
+    r"text_?colou?r|btn_?colou?r|border_?colou?r|accent|surface|on_surface|"
+    r"on_bg|on_primary|on_secondary|on_error|shadow|outline|primary|secondary|"
+    r"error|warning)\b",
+    re.IGNORECASE,
+)
+
+
+def _hex_to_rgba(hex_str: str) -> Optional[tuple]:
+    """Parse #rgb, #rrggbb, #rrggbbaa -> (r, g, b, a) in 0.0-1.0."""
+    h = hex_str.lstrip("#")
+    try:
+        if len(h) == 3:
+            r = int(h[0] * 2, 16) / 255.0
+            g = int(h[1] * 2, 16) / 255.0
+            b = int(h[2] * 2, 16) / 255.0
+            return (r, g, b, 1.0)
+        if len(h) == 6:
+            return (
+                int(h[0:2], 16) / 255.0,
+                int(h[2:4], 16) / 255.0,
+                int(h[4:6], 16) / 255.0,
+                1.0,
+            )
+        if len(h) == 8:
+            return (
+                int(h[0:2], 16) / 255.0,
+                int(h[2:4], 16) / 255.0,
+                int(h[4:6], 16) / 255.0,
+                int(h[6:8], 16) / 255.0,
+            )
+    except ValueError:
+        pass
+    return None
+
+
+def _parse_css_value(raw: str) -> float:
+    """Convert a CSS channel string ('128', '50%') to a 0.0-1.0 float."""
+    raw = raw.strip()
+    if raw.endswith("%"):
+        return max(0.0, min(1.0, float(raw[:-1]) / 100.0))
+    return max(0.0, min(1.0, float(raw) / 255.0))
+
+
+def _parse_css_alpha(raw: Optional[str]) -> float:
+    """Convert a CSS alpha string ('0.5', '50%', '1') to 0.0-1.0 float."""
+    if raw is None:
+        return 1.0
+    raw = raw.strip()
+    if raw.endswith("%"):
+        return max(0.0, min(1.0, float(raw[:-1]) / 100.0))
+    v = float(raw)
+    # Alpha > 1 is treated as a 0-255 integer (non-standard but seen in the wild)
+    return max(0.0, min(1.0, v if v <= 1.0 else v / 255.0))
+
+
+def _hsl_to_rgb(h_deg: float, s_pct: float, l_pct: float) -> tuple:
+    """Convert HSL (degrees, percent, percent) to (r, g, b) in 0.0-1.0."""
+    s = s_pct / 100.0
+    l = l_pct / 100.0
+    c = (1.0 - abs(2.0 * l - 1.0)) * s
+    h_prime = (h_deg % 360.0) / 60.0
+    x = c * (1.0 - abs(h_prime % 2.0 - 1.0))
+    if h_prime < 1:
+        r1, g1, b1 = c, x, 0.0
+    elif h_prime < 2:
+        r1, g1, b1 = x, c, 0.0
+    elif h_prime < 3:
+        r1, g1, b1 = 0.0, c, x
+    elif h_prime < 4:
+        r1, g1, b1 = 0.0, x, c
+    elif h_prime < 5:
+        r1, g1, b1 = x, 0.0, c
+    else:
+        r1, g1, b1 = c, 0.0, x
+    m = l - c / 2.0
+    return (
+        max(0.0, min(1.0, r1 + m)),
+        max(0.0, min(1.0, g1 + m)),
+        max(0.0, min(1.0, b1 + m)),
+    )
+
+
+def _find_triple_string_spans(source: str) -> List[tuple]:
+    """Return list of (start, end) char offsets for every triple-quoted string
+    in *source*.  Used to decide whether a bare ``#`` is a Python comment or
+    string content.
+    """
+    spans: List[tuple] = []
+    i = 0
+    n = len(source)
+    while i < n:
+        # Find the next triple-quote opener (""" or ''')
+        dq = source.find('"""', i)
+        sq = source.find("'''", i)
+        if dq == -1 and sq == -1:
+            break
+        # Pick the closer one; prefer """ on tie
+        if sq == -1 or (dq != -1 and dq <= sq):
+            delim = '"""'
+            start = dq
+        else:
+            delim = "'''"
+            start = sq
+        # Find the matching closer after the opener
+        close = source.find(delim, start + 3)
+        if close == -1:
+            # Unterminated - treat as running to end of file
+            spans.append((start, n))
+            break
+        spans.append((start, close + 3))
+        i = close + 3
+    return spans
+
+
+def _strip_inline_comment(line: str, line_start_offset: int,
+                           triple_spans: List[tuple]) -> str:
+    """Return the portion of *line* before the first bare Python ``#`` comment.
+
+    ``line_start_offset`` is the character offset of the first character of
+    *line* within the whole source file.  ``triple_spans`` is the list
+    returned by :func:`_find_triple_string_spans`.
+
+    A ``#`` that falls inside any triple-quoted string span is **not** treated
+    as a comment delimiter.  Single- and double-quote context within the line
+    is still tracked for the common case of quoted hex colors.
+    """
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        abs_pos = line_start_offset + i
+
+        # If this character is inside a triple-quoted string, it cannot be
+        # a comment delimiter - consume without toggling quote state.
+        in_triple = any(ts <= abs_pos < te for ts, te in triple_spans)
+        if in_triple:
+            i += 1
+            continue
+
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:i]
+        i += 1
+    return line
+
+
+def _collect_document_colors(source: str) -> List[dict]:
+    """textDocument/documentColor - find color values in Python source.
+
+    Detects:
+      * Hex literals (quoted):   ``"#rgb"``, ``"#rrggbb"``, ``"#rrggbbaa"``
+      * Hex literals (bare):     ``#rrggbb`` without quotes (CSS inside triple-strings)
+      * CSS functions:           ``rgb()``, ``rgba()``, ``hsl()``, ``hsla()``
+      * CSS named colors:        ``"red"``, ``"cornflowerblue"``, ...
+      * Integer tuples near color-hinting variable names: ``(255, 0, 0)``
+      * Float tuples  near color-hinting variable names: ``(1.0, 0.0, 0.0)``
+      * pygame.Color integer tuples (any line with pygame + Color)
+    """
+    results: List[dict] = []
+    lines = source.splitlines(keepends=True)
+
+    # Pre-compute triple-quoted string spans once for the whole file so that
+    # _strip_inline_comment can correctly distinguish # in CSS content from
+    # Python inline comments.
+    triple_spans = _find_triple_string_spans(source)
+
+    # Track (line, col_start, col_end) already emitted - prevents duplicates
+    # when multiple passes produce overlapping spans for the same color.
+    _emitted: set = set()
+
+    def _emit(line_0: int, col_start: int, col_end: int, rgba: tuple) -> None:
+        key = (line_0, col_start, col_end)
+        if key in _emitted:
+            return
+        _emitted.add(key)
+        r, g, b, a = rgba
+        results.append({
+            "range": {
+                "start": {"line": line_0, "character": col_start},
+                "end":   {"line": line_0, "character": col_end},
+            },
+            "color": {"red": r, "green": g, "blue": b, "alpha": a},
+        })
+
+    offset = 0  # running char offset into source
+    for line_idx, line_text_raw in enumerate(lines):
+        line_text = line_text_raw.rstrip("\r\n")
+        line_start = offset
+        offset += len(line_text_raw)
+
+        stripped = line_text.strip()
+
+        # Skip pure comment lines and blank lines early.
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        # Strip the inline comment portion for pattern matching.
+        code_part = _strip_inline_comment(line_text, line_start, triple_spans)
+
+        # ------------------------------------------------------------------ #
+        # 1a. Hex color literals inside quotes: "#rgb", '#rrggbb', "#rrggbbaa"
+        # ------------------------------------------------------------------ #
+        for m in _HEX_QUOTED_RE.finditer(code_part):
+            hex_val = m.group(1)
+            rgba = _hex_to_rgba(hex_val)
+            if rgba:
+                col = m.start(1)  # position of '#'
+                _emit(line_idx, col, col + len(hex_val), rgba)
+
+        # ------------------------------------------------------------------ #
+        # 1b. Bare hex tokens (no quotes) - for CSS/HTML inside triple-strings
+        #     and similar unquoted contexts (e.g. CSS custom properties).
+        #     Only emit when the '#' char itself sits inside a triple-string
+        #     span, preventing false positives on Python identifiers/comments.
+        # ------------------------------------------------------------------ #
+        for m in _HEX_BARE_RE.finditer(code_part):
+            abs_hash = line_start + m.start(1)
+            if any(ts <= abs_hash < te for ts, te in triple_spans):
+                hex_val = m.group(1)
+                rgba = _hex_to_rgba(hex_val)
+                if rgba:
+                    col = m.start(1)
+                    _emit(line_idx, col, col + len(hex_val), rgba)
+
+        # ------------------------------------------------------------------ #
+        # 2. CSS functional notation: rgb(), rgba(), hsl(), hsla()
+        #    Detected unconditionally - they are unambiguous.
+        #    Record matched spans so tuple passes below can skip them.
+        # ------------------------------------------------------------------ #
+        func_spans: List[tuple] = []  # (start, end) col pairs of functional matches
+
+        for m in _RGB_FUNC_RE.finditer(code_part):
+            try:
+                r = _parse_css_value(m.group(1))
+                g = _parse_css_value(m.group(2))
+                b = _parse_css_value(m.group(3))
+                a = _parse_css_alpha(m.group(4))
+                _emit(line_idx, m.start(), m.end(), (r, g, b, a))
+                func_spans.append((m.start(), m.end()))
+            except (ValueError, AttributeError):
+                pass
+
+        for m in _HSL_FUNC_RE.finditer(code_part):
+            try:
+                h_deg = float(m.group(1).rstrip("%"))
+                s_pct = float(m.group(2).rstrip("%"))
+                l_pct = float(m.group(3).rstrip("%"))
+                a = _parse_css_alpha(m.group(4))
+                r, g, b = _hsl_to_rgb(h_deg, s_pct, l_pct)
+                _emit(line_idx, m.start(), m.end(), (r, g, b, a))
+                func_spans.append((m.start(), m.end()))
+            except (ValueError, AttributeError):
+                pass
+
+        def _inside_func_span(pos: int) -> bool:
+            """Return True if *pos* falls within any already-matched CSS function span."""
+            return any(fs <= pos < fe for fs, fe in func_spans)
+
+        # ------------------------------------------------------------------ #
+        # 3. CSS named colors inside quotes: "red", 'cornflowerblue', ...
+        #    Detected unconditionally - quoted color names are explicit.
+        # ------------------------------------------------------------------ #
+        for m in _NAMED_COLOR_RE.finditer(code_part):
+            name = m.group(1).lower()
+            rgba = _CSS_COLORS.get(name)
+            if rgba:
+                col = m.start() + 1  # skip the opening quote
+                _emit(line_idx, col, col + len(name), rgba)
+
+        # ------------------------------------------------------------------ #
+        # 4. pygame.Color integer tuples (unconditional when pygame present)
+        # ------------------------------------------------------------------ #
+        if "pygame" in code_part and "Color" in code_part:
+            for m in _TUPLE_RGB_RE.finditer(code_part):
+                if _inside_func_span(m.start()):
+                    continue
+                try:
+                    r_i = int(m.group(1))
+                    g_i = int(m.group(2))
+                    b_i = int(m.group(3))
+                    a_raw = m.group(4)
+                    a_i = int(a_raw) if a_raw is not None else 255
+                    if all(0 <= v <= 255 for v in (r_i, g_i, b_i, a_i)):
+                        _emit(line_idx, m.start(), m.end(),
+                              (r_i / 255.0, g_i / 255.0, b_i / 255.0, a_i / 255.0))
+                except ValueError:
+                    pass
+
+        # ------------------------------------------------------------------ #
+        # 5 & 6. Integer and float tuples gated by color-hinting variable name
+        #         on the same line.  Skip spans already covered by rgb()/hsl().
+        # ------------------------------------------------------------------ #
+        if _COLOR_VAR_RE.search(code_part):
+            # Integer RGB(A): (255, 0, 0) / (255, 0, 0, 128)
+            for m in _TUPLE_RGB_RE.finditer(code_part):
+                if _inside_func_span(m.start()):
+                    continue
+                try:
+                    r_i = int(m.group(1))
+                    g_i = int(m.group(2))
+                    b_i = int(m.group(3))
+                    a_raw = m.group(4)
+                    a_i = int(a_raw) if a_raw is not None else 255
+                    if all(0 <= v <= 255 for v in (r_i, g_i, b_i, a_i)):
+                        _emit(line_idx, m.start(), m.end(),
+                              (r_i / 255.0, g_i / 255.0, b_i / 255.0, a_i / 255.0))
+                except ValueError:
+                    pass
+
+            # Float RGB(A): (1.0, 0.0, 0.0) / (1.0, 0.0, 0.0, 0.5)
+            for m in _TUPLE_FLOAT_RE.finditer(code_part):
+                if _inside_func_span(m.start()):
+                    continue
+                try:
+                    r_f = float(m.group(1))
+                    g_f = float(m.group(2))
+                    b_f = float(m.group(3))
+                    a_f = float(m.group(4)) if m.group(4) is not None else 1.0
+                    if all(0.0 <= v <= 1.0 for v in (r_f, g_f, b_f, a_f)):
+                        _emit(line_idx, m.start(), m.end(), (r_f, g_f, b_f, a_f))
+                except ValueError:
+                    pass
+
+    return results
