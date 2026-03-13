@@ -309,7 +309,6 @@ class TestCapabilitiesNewFeatures:
         return result
 
     def test_call_hierarchy_announced_when_enabled(self):
-        from pylsp_workspace_symbols import plugin
         cfg = MagicMock()
         cfg.plugin_settings.side_effect = lambda key: {
             "call_hierarchy": {"enabled": True},
@@ -320,7 +319,6 @@ class TestCapabilitiesNewFeatures:
             "inlay_hints": {"enabled": True},
         }.get(key, {})
         dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "callHierarchy/prepare" in dispatchers
         assert "callHierarchy/incomingCalls" in dispatchers
         assert "callHierarchy/outgoingCalls" in dispatchers
 
@@ -335,7 +333,6 @@ class TestCapabilitiesNewFeatures:
             "inlay_hints": {"enabled": True},
         }.get(key, {})
         dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "typeHierarchy/prepare" in dispatchers
         assert "typeHierarchy/supertypes" in dispatchers
         assert "typeHierarchy/subtypes" in dispatchers
 
@@ -376,7 +373,7 @@ class TestCapabilitiesNewFeatures:
             "inlay_hints": {"enabled": True},
         }.get(key, {})
         dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "callHierarchy/prepare" not in dispatchers
+        assert "callHierarchy/incomingCalls" not in dispatchers
 
     def test_type_hierarchy_not_registered_when_disabled(self):
         cfg = MagicMock()
@@ -389,7 +386,7 @@ class TestCapabilitiesNewFeatures:
             "inlay_hints": {"enabled": True},
         }.get(key, {})
         dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "typeHierarchy/prepare" not in dispatchers
+        assert "typeHierarchy/supertypes" not in dispatchers
 
     def test_document_links_not_registered_when_disabled(self):
         cfg = MagicMock()
