@@ -266,3 +266,153 @@ class TestSearchSymbols:
             mock_jedi.Project.side_effect = RuntimeError("boom")
             result = _search_symbols(settings, ws, "")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# pylsp_settings — new feature keys
+# ---------------------------------------------------------------------------
+
+class TestPylspSettingsNewFeatures:
+    def test_call_hierarchy_defaults(self):
+        cfg = MagicMock()
+        result = pylsp_settings(cfg)
+        assert result["plugins"]["call_hierarchy"]["enabled"] is True
+
+    def test_type_hierarchy_defaults(self):
+        cfg = MagicMock()
+        result = pylsp_settings(cfg)
+        assert result["plugins"]["type_hierarchy"]["enabled"] is True
+
+    def test_document_links_defaults(self):
+        cfg = MagicMock()
+        result = pylsp_settings(cfg)
+        assert result["plugins"]["document_links"]["enabled"] is True
+
+    def test_document_colors_defaults(self):
+        cfg = MagicMock()
+        result = pylsp_settings(cfg)
+        assert result["plugins"]["document_colors"]["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# capabilities — call/type hierarchy + document links/colors
+# ---------------------------------------------------------------------------
+
+class TestCapabilitiesNewFeatures:
+    def _caps(self, config):
+        from pylsp_workspace_symbols import plugin
+        result = pylsp_experimental_capabilities(config, _make_workspace())
+        if plugin._CAPS_INJECTED:
+            # Injection succeeded — check the monkey-patched capabilities dict
+            # by calling capabilities() directly via the injected method.
+            return plugin._last_injected_caps if hasattr(plugin, "_last_injected_caps") else {}
+        return result
+
+    def test_call_hierarchy_announced_when_enabled(self):
+        from pylsp_workspace_symbols import plugin
+        cfg = MagicMock()
+        cfg.plugin_settings.side_effect = lambda key: {
+            "call_hierarchy": {"enabled": True},
+            "type_hierarchy": {"enabled": True},
+            "document_links": {"enabled": True},
+            "document_colors": {"enabled": True},
+            "jedi_workspace_symbols": {"enabled": True},
+            "inlay_hints": {"enabled": True},
+        }.get(key, {})
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
+        assert "callHierarchy/prepare" in dispatchers
+        assert "callHierarchy/incomingCalls" in dispatchers
+        assert "callHierarchy/outgoingCalls" in dispatchers
+
+    def test_type_hierarchy_announced_when_enabled(self):
+        cfg = MagicMock()
+        cfg.plugin_settings.side_effect = lambda key: {
+            "call_hierarchy": {"enabled": True},
+            "type_hierarchy": {"enabled": True},
+            "document_links": {"enabled": True},
+            "document_colors": {"enabled": True},
+            "jedi_workspace_symbols": {"enabled": True},
+            "inlay_hints": {"enabled": True},
+        }.get(key, {})
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
+        assert "typeHierarchy/prepare" in dispatchers
+        assert "typeHierarchy/supertypes" in dispatchers
+        assert "typeHierarchy/subtypes" in dispatchers
+
+    def test_document_links_handler_registered(self):
+        cfg = MagicMock()
+        cfg.plugin_settings.side_effect = lambda key: {
+            "call_hierarchy": {"enabled": True},
+            "type_hierarchy": {"enabled": True},
+            "document_links": {"enabled": True},
+            "document_colors": {"enabled": True},
+            "jedi_workspace_symbols": {"enabled": True},
+            "inlay_hints": {"enabled": True},
+        }.get(key, {})
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
+        assert "textDocument/documentLink" in dispatchers
+
+    def test_document_colors_handler_registered(self):
+        cfg = MagicMock()
+        cfg.plugin_settings.side_effect = lambda key: {
+            "call_hierarchy": {"enabled": True},
+            "type_hierarchy": {"enabled": True},
+            "document_links": {"enabled": True},
+            "document_colors": {"enabled": True},
+            "jedi_workspace_symbols": {"enabled": True},
+            "inlay_hints": {"enabled": True},
+        }.get(key, {})
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
+        assert "textDocument/documentColor" in dispatchers
+
+    def test_call_hierarchy_not_registered_when_disabled(self):
+        cfg = MagicMock()
+        cfg.plugin_settings.side_effect = lambda key: {
+            "call_hierarchy": {"enabled": False},
+            "type_hierarchy": {"enabled": True},
+            "document_links": {"enabled": True},
+            "document_colors": {"enabled": True},
+            "jedi_workspace_symbols": {"enabled": True},
+            "inlay_hints": {"enabled": True},
+        }.get(key, {})
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
+        assert "callHierarchy/prepare" not in dispatchers
+
+    def test_type_hierarchy_not_registered_when_disabled(self):
+        cfg = MagicMock()
+        cfg.plugin_settings.side_effect = lambda key: {
+            "call_hierarchy": {"enabled": True},
+            "type_hierarchy": {"enabled": False},
+            "document_links": {"enabled": True},
+            "document_colors": {"enabled": True},
+            "jedi_workspace_symbols": {"enabled": True},
+            "inlay_hints": {"enabled": True},
+        }.get(key, {})
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
+        assert "typeHierarchy/prepare" not in dispatchers
+
+    def test_document_links_not_registered_when_disabled(self):
+        cfg = MagicMock()
+        cfg.plugin_settings.side_effect = lambda key: {
+            "call_hierarchy": {"enabled": True},
+            "type_hierarchy": {"enabled": True},
+            "document_links": {"enabled": False},
+            "document_colors": {"enabled": True},
+            "jedi_workspace_symbols": {"enabled": True},
+            "inlay_hints": {"enabled": True},
+        }.get(key, {})
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
+        assert "textDocument/documentLink" not in dispatchers
+
+    def test_document_colors_not_registered_when_disabled(self):
+        cfg = MagicMock()
+        cfg.plugin_settings.side_effect = lambda key: {
+            "call_hierarchy": {"enabled": True},
+            "type_hierarchy": {"enabled": True},
+            "document_links": {"enabled": True},
+            "document_colors": {"enabled": False},
+            "jedi_workspace_symbols": {"enabled": True},
+            "inlay_hints": {"enabled": True},
+        }.get(key, {})
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
+        assert "textDocument/documentColor" not in dispatchers
