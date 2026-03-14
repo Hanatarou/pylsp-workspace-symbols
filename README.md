@@ -144,14 +144,14 @@ variables are never hinted twice.
 ### Call hierarchy
 
 Your LSP client will receive `callHierarchyProvider: true`. Place the cursor on any function name
-and invoke "Show Call Hierarchy" to see incoming callers and outgoing callees. Supported servers:
-rust-analyzer, clangd, and any server that uses standard `callHierarchy/*` requests.
+and invoke "Show Call Hierarchy" to see incoming callers and outgoing callees. Compatible with
+any LSP client that supports the standard `callHierarchy/*` requests (Neovim, eglot, CudaText, etc.).
 
 ### Type hierarchy
 
 Your LSP client will receive `typeHierarchyProvider: true`. Place the cursor on any class name
-and invoke "Show Type Hierarchy" to explore supertypes and subtypes. Supported servers:
-rust-analyzer, clangd, and any server that uses standard `typeHierarchy/*` requests.
+and invoke "Show Type Hierarchy" to explore supertypes and subtypes. Compatible with
+any LSP client that supports the standard `typeHierarchy/*` requests (Neovim, eglot, CudaText, etc.).
 
 ### Document links
 
@@ -190,11 +190,11 @@ The plugin handles the `textDocument/inlayHint` request using a hybrid approach:
 
 ### Call hierarchy
 
-Handled via `callHierarchy/prepare`, `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls` dispatchers. Uses Jedi's `script.goto()` and `script.get_references()` to resolve callers and callees, building LSP-compliant `CallHierarchyItem` structures with correct range information.
+Handled via `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls` dispatchers. Uses Jedi's `script.goto()` and `script.get_references()` to resolve callers and callees, building LSP-compliant `CallHierarchyItem` structures with correct range information.
 
 ### Type hierarchy
 
-Handled via `typeHierarchy/prepare`, `typeHierarchy/supertypes` and `typeHierarchy/subtypes` dispatchers. Uses Jedi's `script.goto()` and class MRO inspection to build the type tree, restricted to an allowlist of servers known to support the feature correctly (rust-analyzer, clangd, etc.).
+Handled via `typeHierarchy/supertypes` and `typeHierarchy/subtypes` dispatchers. Uses Jedi's `script.goto()` and static class inheritance analysis to build the type tree.
 
 ### Document links
 
