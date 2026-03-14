@@ -155,10 +155,11 @@ any LSP client that supports the standard `typeHierarchy/*` requests (Neovim, eg
 
 ### Document links
 
-Your LSP client will receive `documentLinkProvider: true`. URLs in comments and strings become
-clickable links. Import statements are resolved to the corresponding source file in the system
-Python's `Lib/` directory (when Python is installed and available on PATH). Modules without a
-`.py` source (C extensions, frozen modules, embedded-only `.pyc`) are silently skipped.
+Your LSP client will receive `documentLinkProvider: true`. The following are turned into clickable links:
+
+- **URLs** — `http://` and `https://` links in comments and strings
+- **Import statements** — resolved to the corresponding `.py` source file in the system Python's `Lib/` directory (when Python is installed and available on PATH); modules without a `.py` source (C extensions, frozen modules, embedded-only `.pyc`) are silently skipped
+- **Workspace path literals** — relative path strings (e.g. `"./config.json"`, `"../data/file.csv"`) and `open()`/`Path()` calls that reference files present in the workspace
 
 ### Document colors
 
@@ -198,10 +199,11 @@ Handled via `typeHierarchy/supertypes` and `typeHierarchy/subtypes` dispatchers.
 
 ### Document links
 
-Two-pass collection over the source:
+Three-pass collection over the source:
 
 1. **URL pass** — regex scan for `http://` and `https://` URLs in comments, docstrings, and string literals.
 2. **Import pass** — AST parse to find all `import` and `from ... import` statements; resolves each module name to a `.py` file by querying the system Python's `sys.prefix` via a single cached subprocess call.
+3. **Path literal pass** — detects relative path strings, `open()` calls and `Path()` calls whose argument resolves to an existing file inside the workspace root.
 
 Modules without a `.py` source (C extensions, frozen modules, `.pyc`-only embedded builds) are silently skipped.
 
