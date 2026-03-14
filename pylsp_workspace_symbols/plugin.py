@@ -23,6 +23,7 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from pylsp import hookimpl, uris
 
@@ -394,6 +395,11 @@ def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict
     This is necessary because project.search(query) in older bundled Jedi
     performs exact name matching and misses partial matches (e.g. 'area'
     won't find 'calculate_area').
+
+    Results are strictly limited to files inside workspace.root_path.
+    Jedi's complete_search() indexes the full Python environment (stdlib,
+    site-packages, etc.) regardless of the Project path; the root filter
+    below ensures only project-local symbols are returned.
     """
     if _jedi is None:
         log.error("pylsp_workspace_symbols: jedi is not available")
@@ -405,6 +411,9 @@ def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict
         set(settings.get("ignore_folders", [])) | _DEFAULT_IGNORE_FOLDERS
     )
     query_lower = query.lower()
+
+    # Resolve once outside the loop - Path handles separators on all OS.
+    workspace_root = Path(workspace.root_path)
 
     try:
         project = _jedi.Project(path=workspace.root_path)
@@ -433,6 +442,15 @@ def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict
         try:
             module_path = name.module_path
             if module_path is None:
+                continue
+
+            # Restrict to files inside the workspace root.
+            # complete_search() returns symbols from the entire Python
+            # environment; without this guard, stdlib/.pyi/site-packages
+            # symbols leak into results.
+            try:
+                module_path.relative_to(workspace_root)
+            except ValueError:
                 continue
 
             if _in_ignored_folder(str(module_path), ignore_folders):
@@ -474,13 +492,13 @@ class JediHint:
         """Build LSP InlayHint dict or None if no label."""
         if not self.label:
             return None
-    
+
         # Validate character position (prevent out-of-bounds)
         if self.character < 0:
             self.character = 0
         elif self.character > 1000:  # Reasonable max for single line
             self.character = 1000
-    
+
         # Handle parameter hints (appears BEFORE the argument)
         if self.kind == "parameter":
             return {
@@ -494,7 +512,7 @@ class JediHint:
                 "paddingRight": False,
                 "tooltip": self.tooltip or f"Parameter: {self.label}",
             }
-    
+
         # Type hints (return, assign, raise)
         return {
             "position": {
@@ -525,14 +543,14 @@ def _get_inlay_hints(source_code: str, path: str, settings: dict) -> List[dict]:
 
         # Use Jedi-based hint collection
         hints = _collect_jedi_hints(script, source_code, settings)
-        
+
         # Apply max_hints limit
         max_hints = settings.get("max_hints_per_file", 200)
         if max_hints > 0 and len(hints) > max_hints:
             hints = hints[:max_hints]
-            
+
         return [hint.to_hint() for hint in hints if hint.to_hint()]
-        
+
     except Exception as e:
         log.debug("pylsp_workspace_symbols: Jedi inlay hints failed for %s: %s", path, e)
         return []
@@ -542,12 +560,12 @@ def _collect_jedi_hints(script: _jedi.Script, source_code: str, settings: dict) 
     """Collect all inlay hints by scanning source with regex + Jedi inference."""
     hints: List[JediHint] = []
     lines = source_code.splitlines()
-    
+
     show_assign = settings.get("show_assign_types", True)
     show_return = settings.get("show_return_types", True)
     show_raise = settings.get("show_raises", True)
     show_params = settings.get("show_parameter_hints", True)
-    
+
     # Collect hints by scanning source with regex + Jedi inference
     if show_return:
         hints.extend(_find_return_hints(script, source_code, lines))
@@ -557,7 +575,7 @@ def _collect_jedi_hints(script: _jedi.Script, source_code: str, settings: dict) 
         hints.extend(_find_raise_hints(script, source_code, lines))
     if show_params:
         hints.extend(_find_param_hints(script, source_code, lines))
-    
+
     return hints
 
 
@@ -917,7 +935,7 @@ def _find_raise_hints(script: _jedi.Script, source_code: str, lines: List[str]) 
     hints = []
     # Match raise statements: raise ExceptionName
     pattern = r'^\s*raise\s+(\w+)'
-    
+
     for line_num, line in enumerate(lines, 1):
         match = re.search(pattern, line)
         if match:
@@ -944,7 +962,7 @@ def _find_raise_hints(script: _jedi.Script, source_code: str, lines: List[str]) 
                     label=f"Raises: {exc_name}",
                     tooltip=f"Raises: {exc_name}"
                 ))
-    
+
     return hints
 
 
