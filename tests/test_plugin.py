@@ -232,8 +232,8 @@ class TestSearchSymbols:
 
     def test_skips_ignored_folder(self):
         names = [
-            _make_jedi_name("hidden", "function", module_path="/project/.venv/lib/mod.py"),
-            _make_jedi_name("visible", "function", module_path="/project/src/mod.py"),
+            _make_jedi_name("hidden", "function", module_path="/tmp/project/.venv/lib/mod.py"),
+            _make_jedi_name("visible", "function", module_path="/tmp/project/src/mod.py"),
         ]
         results = self._run(names, query="")
         assert len(results) == 1
@@ -241,7 +241,7 @@ class TestSearchSymbols:
 
     def test_result_structure(self):
         names = [_make_jedi_name("my_func", "function",
-                                 module_path="/project/mod.py",
+                                 module_path="/tmp/project/mod.py",
                                  module_name="mod", line=5, column=0)]
         results = self._run(names, query="my_func")
         assert len(results) == 1
