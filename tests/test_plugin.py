@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,7 +12,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pylsp_workspace_symbols.plugin import (
     _DEFAULT_IGNORE_FOLDERS,
+    _cl_cache_get,
+    _cl_cache_set,
     _in_ignored_folder,
+    _literal_type,
     _search_symbols,
     pylsp_dispatchers,
     pylsp_experimental_capabilities,
@@ -91,13 +93,43 @@ class TestInIgnoredFolder:
 # ---------------------------------------------------------------------------
 
 class TestPylspSettings:
-    def test_returns_defaults(self):
+    def test_workspace_symbols_defaults(self):
         cfg = MagicMock()
         result = pylsp_settings(cfg)
-        plugin_cfg = result["plugins"]["jedi_workspace_symbols"]
-        assert plugin_cfg["enabled"] is True
-        assert plugin_cfg["max_symbols"] == 500
-        assert plugin_cfg["ignore_folders"] == []
+        ws = result["plugins"]["jedi_workspace_symbols"]
+        assert ws["enabled"] is True
+        assert ws["max_symbols"] == 500
+        assert ws["ignore_folders"] == []
+
+    def test_call_hierarchy_defaults(self):
+        cfg = MagicMock()
+        assert pylsp_settings(cfg)["plugins"]["call_hierarchy"]["enabled"] is True
+
+    def test_type_hierarchy_defaults(self):
+        cfg = MagicMock()
+        assert pylsp_settings(cfg)["plugins"]["type_hierarchy"]["enabled"] is True
+
+    def test_document_links_defaults(self):
+        cfg = MagicMock()
+        assert pylsp_settings(cfg)["plugins"]["document_links"]["enabled"] is True
+
+    def test_document_colors_defaults(self):
+        cfg = MagicMock()
+        assert pylsp_settings(cfg)["plugins"]["document_colors"]["enabled"] is True
+
+    def test_code_lens_defaults(self):
+        cfg = MagicMock()
+        cl = pylsp_settings(cfg)["plugins"]["code_lens"]
+        assert cl["enabled"] is True
+        assert cl["show_references"] is True
+        assert cl["show_implementations"] is True
+        assert cl["show_run"] is True
+        assert cl["show_tests"] is True
+        assert cl["max_definitions"] == 150
+
+    def test_semantic_tokens_disabled_by_default(self):
+        cfg = MagicMock()
+        assert pylsp_settings(cfg)["plugins"]["semantic_tokens"]["enabled"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -108,10 +140,6 @@ class TestExperimentalCapabilities:
     def test_advertises_when_enabled(self):
         cfg = _make_config(_make_settings(enabled=True))
         ws = _make_workspace()
-        # When capability injection succeeds (_CAPS_INJECTED=True), the hook
-        # intentionally returns {} to avoid announcing capabilities twice.
-        # When injection fails (_CAPS_INJECTED=False), it returns the full dict.
-        # Both outcomes are valid — we check the contract holds in either case.
         from pylsp_workspace_symbols import plugin
         result = pylsp_experimental_capabilities(cfg, ws)
         if plugin._CAPS_INJECTED:
@@ -132,24 +160,20 @@ class TestExperimentalCapabilities:
 # ---------------------------------------------------------------------------
 
 class TestPylspDispatchers:
-    def test_registers_handler_when_enabled(self):
+    def test_registers_workspace_symbol_handler(self):
         cfg = _make_config(_make_settings(enabled=True))
-        ws = _make_workspace()
-        dispatchers = pylsp_dispatchers(cfg, ws)
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
         assert "workspace/symbol" in dispatchers
         assert callable(dispatchers["workspace/symbol"])
 
     def test_empty_when_disabled(self):
         cfg = _make_config(_make_settings(enabled=False))
-        ws = _make_workspace()
-        assert pylsp_dispatchers(cfg, ws) == {}
+        assert pylsp_dispatchers(cfg, _make_workspace()) == {}
 
     def test_handler_extracts_query_from_dict(self):
         cfg = _make_config(_make_settings(enabled=True))
-        ws = _make_workspace()
-        dispatchers = pylsp_dispatchers(cfg, ws)
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
         handler = dispatchers["workspace/symbol"]
-
         with patch("pylsp_workspace_symbols.plugin._search_symbols", return_value=[]) as mock_search:
             handler({"query": "foo"})
             mock_search.assert_called_once()
@@ -158,10 +182,8 @@ class TestPylspDispatchers:
 
     def test_handler_defaults_query_when_not_dict(self):
         cfg = _make_config(_make_settings(enabled=True))
-        ws = _make_workspace()
-        dispatchers = pylsp_dispatchers(cfg, ws)
+        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
         handler = dispatchers["workspace/symbol"]
-
         with patch("pylsp_workspace_symbols.plugin._search_symbols", return_value=[]) as mock_search:
             handler(None)
             _, _, query = mock_search.call_args[0]
@@ -178,7 +200,6 @@ class TestSearchSymbols:
         ws = _make_workspace()
         mock_project = MagicMock()
         mock_project.complete_search.return_value = iter(names)
-
         with patch("pylsp_workspace_symbols.plugin._jedi") as mock_jedi:
             mock_jedi.Project.return_value = mock_project
             return _search_symbols(settings, ws, query)
@@ -188,8 +209,7 @@ class TestSearchSymbols:
             _make_jedi_name("calculate_area", "function"),
             _make_jedi_name("Circle", "class"),
         ]
-        results = self._run(names, query="")
-        assert len(results) == 2
+        assert len(self._run(names, query="")) == 2
 
     def test_substring_filter_case_insensitive(self):
         names = [
@@ -203,8 +223,7 @@ class TestSearchSymbols:
 
     def test_case_insensitive_match(self):
         names = [_make_jedi_name("Calculate", "function")]
-        results = self._run(names, query="CALC")
-        assert len(results) == 1
+        assert len(self._run(names, query="CALC")) == 1
 
     def test_skips_param_type(self):
         names = [
@@ -217,18 +236,15 @@ class TestSearchSymbols:
 
     def test_skips_none_module_path(self):
         names = [_make_jedi_name("builtin_func", "function", module_path=None)]
-        results = self._run(names, query="")
-        assert results == []
+        assert self._run(names, query="") == []
 
     def test_respects_max_symbols(self):
         names = [_make_jedi_name(f"func_{i}", "function") for i in range(10)]
-        results = self._run(names, query="", max_symbols=3)
-        assert len(results) == 3
+        assert len(self._run(names, query="", max_symbols=3)) == 3
 
     def test_max_symbols_zero_means_no_limit(self):
         names = [_make_jedi_name(f"func_{i}", "function") for i in range(100)]
-        results = self._run(names, query="", max_symbols=0)
-        assert len(results) == 100
+        assert len(self._run(names, query="", max_symbols=0)) == 100
 
     def test_skips_ignored_folder(self):
         names = [
@@ -253,163 +269,211 @@ class TestSearchSymbols:
         assert r["location"]["range"]["start"]["character"] == 0
 
     def test_returns_none_when_jedi_unavailable(self):
-        settings = _make_settings()
-        ws = _make_workspace()
         with patch("pylsp_workspace_symbols.plugin._jedi", None):
-            result = _search_symbols(settings, ws, "")
+            result = _search_symbols(_make_settings(), _make_workspace(), "")
         assert result is None
 
     def test_returns_none_on_jedi_exception(self):
-        settings = _make_settings()
-        ws = _make_workspace()
         with patch("pylsp_workspace_symbols.plugin._jedi") as mock_jedi:
             mock_jedi.Project.side_effect = RuntimeError("boom")
-            result = _search_symbols(settings, ws, "")
+            result = _search_symbols(_make_settings(), _make_workspace(), "")
         assert result is None
 
 
 # ---------------------------------------------------------------------------
-# pylsp_settings — new feature keys
+# _literal_type
 # ---------------------------------------------------------------------------
 
-class TestPylspSettingsNewFeatures:
-    def test_call_hierarchy_defaults(self):
-        cfg = MagicMock()
-        result = pylsp_settings(cfg)
-        assert result["plugins"]["call_hierarchy"]["enabled"] is True
-
-    def test_type_hierarchy_defaults(self):
-        cfg = MagicMock()
-        result = pylsp_settings(cfg)
-        assert result["plugins"]["type_hierarchy"]["enabled"] is True
-
-    def test_document_links_defaults(self):
-        cfg = MagicMock()
-        result = pylsp_settings(cfg)
-        assert result["plugins"]["document_links"]["enabled"] is True
-
-    def test_document_colors_defaults(self):
-        cfg = MagicMock()
-        result = pylsp_settings(cfg)
-        assert result["plugins"]["document_colors"]["enabled"] is True
+class TestLiteralType:
+    def test_none(self):           assert _literal_type("None")    == "None"
+    def test_bool_true(self):      assert _literal_type("True")    == "bool"
+    def test_bool_false(self):     assert _literal_type("False")   == "bool"
+    def test_int(self):            assert _literal_type("42")      == "int"
+    def test_negative_int(self):   assert _literal_type("-7")      == "int"
+    def test_float(self):          assert _literal_type("3.14")    == "float"
+    def test_string_double(self):  assert _literal_type('"hello"') == "str"
+    def test_string_single(self):  assert _literal_type("'hello'") == "str"
+    def test_fstring(self):        assert _literal_type('f"hi {x}"') == "str"
+    def test_bytes(self):          assert _literal_type('b"data"') == "bytes"
+    def test_list(self):           assert _literal_type("[1, 2]")  == "list"
+    def test_tuple_explicit(self): assert _literal_type("(1, 2)")  == "tuple"
+    def test_dict(self):           assert _literal_type('{"k": 1}') == "dict"
+    def test_set(self):            assert _literal_type("{1, 2}")  == "set"
+    def test_lambda(self):         assert _literal_type("lambda x: x") == "Callable"
+    def test_implicit_tuple(self): assert _literal_type("1, 'a'") == "tuple"
+    def test_unknown(self):        assert _literal_type("func()")  is None
+    def test_empty(self):          assert _literal_type("")        is None
 
 
 # ---------------------------------------------------------------------------
-# capabilities — call/type hierarchy + document links/colors
+# _cl_cache
 # ---------------------------------------------------------------------------
 
-class TestCapabilitiesNewFeatures:
-    def _caps(self, config):
+class TestClCache:
+    def setup_method(self):
         from pylsp_workspace_symbols import plugin
-        result = pylsp_experimental_capabilities(config, _make_workspace())
-        if plugin._CAPS_INJECTED:
-            # Injection succeeded — check the monkey-patched capabilities dict
-            # by calling capabilities() directly via the injected method.
-            return plugin._last_injected_caps if hasattr(plugin, "_last_injected_caps") else {}
-        return result
+        with plugin._CL_CACHE_LOCK:
+            plugin._CL_CACHE.clear()
 
-    def test_call_hierarchy_announced_when_enabled(self):
-        cfg = MagicMock()
-        cfg.plugin_settings.side_effect = lambda key: {
-            "call_hierarchy": {"enabled": True},
-            "type_hierarchy": {"enabled": True},
-            "document_links": {"enabled": True},
-            "document_colors": {"enabled": True},
-            "jedi_workspace_symbols": {"enabled": True},
-            "inlay_hints": {"enabled": True},
-        }.get(key, {})
-        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "callHierarchy/incomingCalls" in dispatchers
-        assert "callHierarchy/outgoingCalls" in dispatchers
+    def test_miss_on_empty_cache(self):
+        assert _cl_cache_get("file:///a.py", "abc123") is None
 
-    def test_type_hierarchy_announced_when_enabled(self):
-        cfg = MagicMock()
-        cfg.plugin_settings.side_effect = lambda key: {
-            "call_hierarchy": {"enabled": True},
-            "type_hierarchy": {"enabled": True},
-            "document_links": {"enabled": True},
-            "document_colors": {"enabled": True},
-            "jedi_workspace_symbols": {"enabled": True},
-            "inlay_hints": {"enabled": True},
-        }.get(key, {})
-        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "typeHierarchy/supertypes" in dispatchers
-        assert "typeHierarchy/subtypes" in dispatchers
+    def test_hit_after_set(self):
+        lenses = [{"range": {}, "command": {"title": "test"}}]
+        _cl_cache_set("file:///a.py", "abc123", lenses)
+        assert _cl_cache_get("file:///a.py", "abc123") == lenses
 
-    def test_document_links_handler_registered(self):
-        cfg = MagicMock()
-        cfg.plugin_settings.side_effect = lambda key: {
-            "call_hierarchy": {"enabled": True},
-            "type_hierarchy": {"enabled": True},
-            "document_links": {"enabled": True},
-            "document_colors": {"enabled": True},
-            "jedi_workspace_symbols": {"enabled": True},
-            "inlay_hints": {"enabled": True},
-        }.get(key, {})
-        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "textDocument/documentLink" in dispatchers
+    def test_miss_on_wrong_hash(self):
+        _cl_cache_set("file:///a.py", "abc123", [])
+        assert _cl_cache_get("file:///a.py", "wrong") is None
 
-    def test_document_colors_handler_registered(self):
-        cfg = MagicMock()
-        cfg.plugin_settings.side_effect = lambda key: {
-            "call_hierarchy": {"enabled": True},
-            "type_hierarchy": {"enabled": True},
-            "document_links": {"enabled": True},
-            "document_colors": {"enabled": True},
-            "jedi_workspace_symbols": {"enabled": True},
-            "inlay_hints": {"enabled": True},
-        }.get(key, {})
-        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "textDocument/documentColor" in dispatchers
+    def test_miss_on_wrong_uri(self):
+        _cl_cache_set("file:///a.py", "abc123", [])
+        assert _cl_cache_get("file:///b.py", "abc123") is None
 
-    def test_call_hierarchy_not_registered_when_disabled(self):
-        cfg = MagicMock()
-        cfg.plugin_settings.side_effect = lambda key: {
-            "call_hierarchy": {"enabled": False},
-            "type_hierarchy": {"enabled": True},
-            "document_links": {"enabled": True},
-            "document_colors": {"enabled": True},
-            "jedi_workspace_symbols": {"enabled": True},
-            "inlay_hints": {"enabled": True},
-        }.get(key, {})
-        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "callHierarchy/incomingCalls" not in dispatchers
+    def test_overwrite_same_uri(self):
+        _cl_cache_set("file:///a.py", "h1", [{"old": True}])
+        _cl_cache_set("file:///a.py", "h2", [{"new": True}])
+        assert _cl_cache_get("file:///a.py", "h2") == [{"new": True}]
+        assert _cl_cache_get("file:///a.py", "h1") is None
 
-    def test_type_hierarchy_not_registered_when_disabled(self):
-        cfg = MagicMock()
-        cfg.plugin_settings.side_effect = lambda key: {
-            "call_hierarchy": {"enabled": True},
-            "type_hierarchy": {"enabled": False},
-            "document_links": {"enabled": True},
-            "document_colors": {"enabled": True},
-            "jedi_workspace_symbols": {"enabled": True},
-            "inlay_hints": {"enabled": True},
-        }.get(key, {})
-        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "typeHierarchy/supertypes" not in dispatchers
 
-    def test_document_links_not_registered_when_disabled(self):
-        cfg = MagicMock()
-        cfg.plugin_settings.side_effect = lambda key: {
-            "call_hierarchy": {"enabled": True},
-            "type_hierarchy": {"enabled": True},
-            "document_links": {"enabled": False},
-            "document_colors": {"enabled": True},
-            "jedi_workspace_symbols": {"enabled": True},
-            "inlay_hints": {"enabled": True},
-        }.get(key, {})
-        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "textDocument/documentLink" not in dispatchers
+# ---------------------------------------------------------------------------
+# pylsp_code_lens (hook)
+# ---------------------------------------------------------------------------
 
-    def test_document_colors_not_registered_when_disabled(self):
+class TestPylspCodeLens:
+    def _make_doc(self, source, path="/tmp/project/mod.py"):
+        doc = MagicMock()
+        doc.source = source
+        doc.path = path
+        doc.uri = f"file://{path}"
+        return doc
+
+    def _make_cfg(self, enabled=True):
         cfg = MagicMock()
-        cfg.plugin_settings.side_effect = lambda key: {
-            "call_hierarchy": {"enabled": True},
-            "type_hierarchy": {"enabled": True},
-            "document_links": {"enabled": True},
-            "document_colors": {"enabled": False},
-            "jedi_workspace_symbols": {"enabled": True},
-            "inlay_hints": {"enabled": True},
-        }.get(key, {})
-        dispatchers = pylsp_dispatchers(cfg, _make_workspace())
-        assert "textDocument/documentColor" not in dispatchers
+        cfg.plugin_settings.return_value = {
+            "enabled": enabled,
+            "show_references": True,
+            "show_implementations": True,
+            "show_run": True,
+            "show_tests": True,
+            "max_definitions": 150,
+        }
+        return cfg
+
+    def test_returns_empty_when_disabled(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        doc = self._make_doc("def foo(): pass")
+        assert pylsp_code_lens(self._make_cfg(enabled=False), _make_workspace(), doc) == []
+
+    def test_returns_list_for_simple_function(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        doc = self._make_doc("def foo():\n    pass\n")
+        result = pylsp_code_lens(self._make_cfg(), _make_workspace(), doc)
+        assert isinstance(result, list)
+        titles = [l["command"]["title"] for l in result]
+        assert any("reference" in t for t in titles)
+
+    def test_run_lens_on_main_block(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        source = 'if __name__ == "__main__":\n    pass\n'
+        doc = self._make_doc(source)
+        result = pylsp_code_lens(self._make_cfg(), _make_workspace(), doc)
+        titles = [l["command"]["title"] for l in result]
+        assert "\u25b6 Run" in titles
+
+    def test_test_lens_on_test_function(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        doc = self._make_doc("def test_something():\n    assert True\n")
+        result = pylsp_code_lens(self._make_cfg(), _make_workspace(), doc)
+        titles = [l["command"]["title"] for l in result]
+        assert any("Run test" in t for t in titles)
+
+    def test_implementations_lens_on_subclass(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        source = "class Base:\n    pass\n\nclass Child(Base):\n    pass\n"
+        doc = self._make_doc(source)
+        result = pylsp_code_lens(self._make_cfg(), _make_workspace(), doc)
+        titles = [l["command"]["title"] for l in result]
+        assert any("implementation" in t for t in titles)
+
+    def test_returns_empty_on_syntax_error(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        doc = self._make_doc("def (broken syntax")
+        assert pylsp_code_lens(self._make_cfg(), _make_workspace(), doc) == []
+
+    def test_cache_used_on_repeated_call(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens, _CL_CACHE, _CL_CACHE_LOCK
+        with _CL_CACHE_LOCK:
+            _CL_CACHE.clear()
+        source = "def foo():\n    pass\n"
+        doc = self._make_doc(source)
+        ws = _make_workspace()
+        result1 = pylsp_code_lens(self._make_cfg(), ws, doc)
+        result2 = pylsp_code_lens(self._make_cfg(), ws, doc)
+        assert result1 == result2
+
+
+# ---------------------------------------------------------------------------
+# dispatcher feature registration
+# ---------------------------------------------------------------------------
+
+class TestDispatcherFeatureRegistration:
+    def _cfg(self, overrides=None):
+        base = {
+            "call_hierarchy":        {"enabled": True},
+            "type_hierarchy":        {"enabled": True},
+            "document_links":        {"enabled": True},
+            "document_colors":       {"enabled": True},
+            "jedi_workspace_symbols":{"enabled": True},
+            "inlay_hints":           {"enabled": True},
+            "code_lens":             {"enabled": True},
+            "semantic_tokens":       {"enabled": True},
+        }
+        if overrides:
+            base.update(overrides)
+        cfg = MagicMock()
+        cfg.plugin_settings.side_effect = lambda key: base.get(key, {})
+        return cfg
+
+    def test_all_handlers_registered(self):
+        d = pylsp_dispatchers(self._cfg(), _make_workspace())
+        for method in (
+            "workspace/symbol",
+            "textDocument/inlayHint",
+            "textDocument/prepareCallHierarchy",
+            "callHierarchy/incomingCalls",
+            "callHierarchy/outgoingCalls",
+            "textDocument/prepareTypeHierarchy",
+            "typeHierarchy/supertypes",
+            "typeHierarchy/subtypes",
+            "textDocument/documentLink",
+            "textDocument/documentColor",
+            "textDocument/colorPresentation",
+            "textDocument/semanticTokens/full",
+            "textDocument/semanticTokens/full/delta",
+            "textDocument/semanticTokens/range",
+        ):
+            assert method in d, f"Missing dispatcher: {method}"
+
+    def test_semantic_tokens_absent_when_disabled(self):
+        d = pylsp_dispatchers(self._cfg({"semantic_tokens": {"enabled": False}}), _make_workspace())
+        assert "textDocument/semanticTokens/full" not in d
+
+    def test_call_hierarchy_absent_when_disabled(self):
+        d = pylsp_dispatchers(self._cfg({"call_hierarchy": {"enabled": False}}), _make_workspace())
+        assert "callHierarchy/incomingCalls" not in d
+
+    def test_type_hierarchy_absent_when_disabled(self):
+        d = pylsp_dispatchers(self._cfg({"type_hierarchy": {"enabled": False}}), _make_workspace())
+        assert "typeHierarchy/supertypes" not in d
+
+    def test_document_links_absent_when_disabled(self):
+        d = pylsp_dispatchers(self._cfg({"document_links": {"enabled": False}}), _make_workspace())
+        assert "textDocument/documentLink" not in d
+
+    def test_document_colors_absent_when_disabled(self):
+        d = pylsp_dispatchers(self._cfg({"document_colors": {"enabled": False}}), _make_workspace())
+        assert "textDocument/documentColor" not in d
+        assert "textDocument/colorPresentation" not in d
