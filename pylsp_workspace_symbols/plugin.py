@@ -1,27 +1,38 @@
-"""pylsp-workspace-symbols: workspace/symbol support and inlay hints for python-lsp-server via Jedi.
+"""pylsp-workspace-symbols: workspace/symbol, inlay hints, semantic tokens and more for python-lsp-server via Jedi.
 
-Strategy: pylsp's hookspecs.py does not define hookspecs for workspace symbols or
-inlay hints as proper capabilities, so this plugin uses a two-pronged approach:
+Strategy: pylsp's hookspecs.py does not define hookspecs for workspace symbols,
+inlay hints or semantic tokens as proper capabilities, so this plugin uses a
+two-pronged approach:
 
   1. Capability injection (preferred): at import time, monkey-patch
-     PythonLSPServer.capabilities() to insert workspaceSymbolProvider and
-     inlayHintProvider directly into the proper capabilities dict.
-     This makes the plugin work out-of-the-box with clients that require
-     proper capabilities (eglot, Neovim, etc.).
+     PythonLSPServer.capabilities() to insert workspaceSymbolProvider,
+     inlayHintProvider and semanticTokensProvider directly into the proper
+     capabilities dict.  This makes the plugin work out-of-the-box with clients
+     that require proper capabilities (eglot, Neovim, CudaText, etc.).
 
   2. Fallback via pylsp_experimental_capabilities: if the injection fails
      (e.g. pylsp changed its internal API), the capabilities are announced
-     via the experimental channel instead. Clients that honour experimental
-     capabilities (CudaText, VSCode with pylsp, etc.) will still work.
+     via the experimental channel instead.
 
   3. Register a custom JSON-RPC dispatcher via pylsp_dispatchers that intercepts
-     the "workspace/symbol" and "textDocument/inlayHint" methods and calls
-     our Jedi-backed implementations.
+     "workspace/symbol", "textDocument/inlayHint",
+     "textDocument/semanticTokens/full" and "textDocument/semanticTokens/range"
+     and calls our Jedi-backed implementations.
+
+Semantic tokens implementation notes:
+  - Uses jedi.Script.get_names(all_scopes=True) for a single O(n) pass over
+    the file - no per-token ``goto`` calls, keeping latency low.
+  - Token types follow the standard LSP legend that cuda_bun_lsp already
+    declares in its initialize request, so no client changes are needed.
+  - Modifiers: ``definition`` is set on definition sites; ``async`` on async
+    functions/methods; ``defaultLibrary`` on builtins/stdlib names.
+  - Disabled by default; enable via pylsp.plugins.semantic_tokens.enabled.
 """
 from __future__ import annotations
 import logging
 import re
 import threading
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -75,6 +86,15 @@ def _inject_capabilities() -> bool:
             caps.setdefault("typeHierarchyProvider", True)
             caps.setdefault("documentLinkProvider", {"resolveProvider": False})
             caps.setdefault("colorProvider", True)
+            caps.setdefault("codeLensProvider", {"resolveProvider": False})
+            caps.setdefault("semanticTokensProvider", {
+                "legend": {
+                    "tokenTypes": list(_ST_TOKEN_TYPES.keys()),
+                    "tokenModifiers": list(_ST_TOKEN_MODIFIERS.keys()),
+                },
+                "full": {"delta": True},
+                "range": True,
+            })
             return caps
 
         python_lsp.PythonLSPServer.capabilities = _patched
@@ -115,10 +135,89 @@ _DEFAULT_IGNORE_FOLDERS = {
     "dist", "build", ".eggs", "egg-info",  # matches any *.egg-info folder
 }
 
+# ---------------------------------------------------------------------------
+# Semantic token legend
+# Must match the tokenTypes / tokenModifiers declared in cuda_bun_lsp's
+# initialize request (lsp_client.py SemanticTokensManager.TOKEN_TYPES /
+# TOKEN_MODIFIERS) so the client can interpret the indices correctly.
+# ---------------------------------------------------------------------------
 
-# Prevents re-creating Script objects for the same file path
-_JEDI_CACHE: Dict[str, _jedi.Script] = {}
+# Token type name -> index in the legend list sent to the client
+_ST_TOKEN_TYPES: Dict[str, int] = {
+    "namespace":     0,
+    "type":          1,
+    "class":         2,
+    "enum":          3,
+    "interface":     4,
+    "struct":        5,
+    "typeParameter": 6,
+    "parameter":     7,
+    "variable":      8,
+    "property":      9,
+    "enumMember":    10,
+    "event":         11,
+    "function":      12,
+    "method":        13,
+    "macro":         14,
+    "keyword":       15,
+    "modifier":      16,
+    "comment":       17,
+    "string":        18,
+    "number":        19,
+    "regexp":        20,
+    "operator":      21,
+    "decorator":     22,
+}
+
+# Token modifier name -> bit index
+_ST_TOKEN_MODIFIERS: Dict[str, int] = {
+    "declaration":    0,
+    "definition":     1,
+    "readonly":       2,
+    "static":         3,
+    "deprecated":     4,
+    "abstract":       5,
+    "async":          6,
+    "modification":   7,
+    "documentation":  8,
+    "defaultLibrary": 9,
+}
+
+# Jedi name type -> LSP semantic token type name
+_JEDI_TYPE_TO_ST: Dict[str, str] = {
+    "module":    "namespace",
+    "class":     "class",
+    "function":  "function",
+    "instance":  "variable",
+    "param":     "parameter",
+    "keyword":   "keyword",
+    "property":  "property",
+    "statement": "variable",
+    "path":      "namespace",
+}
+
+# stdlib / builtin module names for defaultLibrary modifier detection
+_STDLIB_TOP = frozenset({
+    "builtins", "__builtins__", "abc", "ast", "asyncio", "collections",
+    "contextlib", "copy", "dataclasses", "datetime", "enum", "functools",
+    "io", "itertools", "json", "logging", "math", "operator", "os",
+    "pathlib", "pickle", "re", "shutil", "signal", "socket", "struct",
+    "subprocess", "sys", "threading", "time", "traceback", "typing",
+    "types", "unittest", "urllib", "warnings", "weakref",
+})
+
+
+# Cache: (path, hash(source)) -> jedi.Script.  Keyed by content hash so
+# edits before save always get a fresh Script (jedi.Script is immutable).
+_JEDI_CACHE: Dict[tuple, Any] = {}
 _CACHE_LOCK = threading.Lock()
+
+# Semantic tokens delta cache: uri -> (result_id, data[]).
+# Allows computing SemanticTokensDelta without re-running Jedi.
+_ST_CACHE: Dict[str, tuple] = {}  # uri -> (result_id: str, data: List[int])
+_ST_CACHE_LOCK = threading.Lock()
+_ST_RESULT_ID_COUNTER: List[int] = [0]  # mutable counter shared across calls
+_ST_COUNTER_LOCK = threading.Lock()     # dedicated lock - separate from cache lock
 
 
 @hookimpl
@@ -151,8 +250,51 @@ def pylsp_settings(config) -> dict:
             "document_colors": {
                 "enabled": True,
             },
+            "code_lens": {
+                "enabled": True,
+                "show_references": True,
+                "show_implementations": True,
+                "show_run": True,
+                "show_tests": True,
+                "max_definitions": 150,
+            },
+            "semantic_tokens": {
+                "enabled": False,  # opt-in: can be slow on very large files
+            },
         }
     }
+
+
+@hookimpl
+def pylsp_code_lens(config, workspace, document) -> List[dict]:
+    """pylsp hook: textDocument/codeLens - Jedi-backed code lenses.
+
+    Called directly by pylsp (has native hookspec), so this hook takes
+    priority over the dispatcher for codeLens requests.
+
+    Returns lenses for:
+      - "👥 N references"     on every top-level function, method, and class
+      - "🔗 N implementations" on classes with subclasses and methods with overrides
+      - "▶ Run"               on ``if __name__ == "__main__":`` blocks
+      - "🧪 Run test"         on ``test_*`` functions and ``Test*`` classes
+    """
+    settings_cl = config.plugin_settings("code_lens")
+    if not settings_cl.get("enabled", True):
+        return []
+    if not HAS_INLAY_DEPS:
+        return []
+    try:
+        root_path = getattr(workspace, "root_path", None)
+        return _get_code_lenses(
+            document.source,
+            document.path,
+            document.uri,
+            settings_cl,
+            workspace_root=root_path,
+        )
+    except Exception as exc:
+        log.error("pylsp_workspace_symbols: pylsp_code_lens: %s", exc)
+        return []
 
 
 @hookimpl
@@ -194,6 +336,17 @@ def pylsp_experimental_capabilities(config, workspace) -> dict:
         caps["documentLinkProvider"] = {"resolveProvider": False}
     if config.plugin_settings("document_colors").get("enabled", True):
         caps["colorProvider"] = True
+    if config.plugin_settings("code_lens").get("enabled", True) and HAS_INLAY_DEPS:
+        caps["codeLensProvider"] = {"resolveProvider": False}
+    if config.plugin_settings("semantic_tokens").get("enabled", False) and HAS_INLAY_DEPS:
+        caps["semanticTokensProvider"] = {
+            "legend": {
+                "tokenTypes": list(_ST_TOKEN_TYPES.keys()),
+                "tokenModifiers": list(_ST_TOKEN_MODIFIERS.keys()),
+            },
+            "full": {"delta": True},
+            "range": True,
+        }
     return caps
 
 
@@ -363,6 +516,121 @@ def pylsp_dispatchers(config, workspace) -> dict:
 
         dispatch["textDocument/documentColor"] = _document_color
 
+        def _color_presentation(params) -> List[dict]:
+            """textDocument/colorPresentation - representations for a picked color.
+
+            Called by the editor's color picker after the user selects a new
+            color value.  Returns alternative text representations so the user
+            can choose which format to insert.
+            """
+            if not isinstance(params, dict):
+                return []
+            uri = (params.get("textDocument") or {}).get("uri")
+            color = params.get("color") or {}
+            range_ = params.get("range") or {}
+            if not uri or not color:
+                return []
+            try:
+                document = workspace.get_document(uri)
+                # Extract the text currently at the range so we can infer format
+                start = (range_.get("start") or {})
+                end   = (range_.get("end") or {})
+                sl, sc = start.get("line", 0), start.get("character", 0)
+                el, ec = end.get("line", sl),  end.get("character", sc)
+                src_lines = (document.source or "").splitlines()
+                if sl < len(src_lines) and sl == el:
+                    context_text = src_lines[sl][sc:ec]
+                else:
+                    context_text = ""
+                return _color_presentations(color, range_, context_text)
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: colorPresentation: %s", exc)
+                return []
+
+        dispatch["textDocument/colorPresentation"] = _color_presentation
+
+
+    # -- Semantic tokens -------------------------------------------------------
+    settings_st = config.plugin_settings("semantic_tokens")
+    if settings_st.get("enabled", False) and HAS_INLAY_DEPS:
+        def _semantic_tokens_full(params) -> dict:
+            if not isinstance(params, dict):
+                return {"data": []}
+            uri = (params.get("textDocument") or {}).get("uri")
+            if not uri:
+                return {"data": []}
+            try:
+                document = workspace.get_document(uri)
+                data = _get_semantic_tokens(document.source, document.path)
+                result_id = _st_next_result_id()
+                with _ST_CACHE_LOCK:
+                    _ST_CACHE[uri] = (result_id, data)
+                return {"resultId": result_id, "data": data}
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: semanticTokens/full: %s", exc)
+                return {"data": []}
+
+        def _semantic_tokens_full_delta(params) -> dict:
+            """textDocument/semanticTokens/full/delta - incremental update.
+
+            Returns SemanticTokensDelta if previousResultId matches the cache,
+            otherwise falls back to a full SemanticTokens response so the client
+            always gets a valid result.
+            """
+            if not isinstance(params, dict):
+                return {"edits": []}
+            uri = (params.get("textDocument") or {}).get("uri")
+            previous_result_id = params.get("previousResultId", "")
+            if not uri:
+                return {"edits": []}
+            try:
+                document = workspace.get_document(uri)
+                new_data = _get_semantic_tokens(document.source, document.path)
+                new_result_id = _st_next_result_id()
+
+                with _ST_CACHE_LOCK:
+                    cached = _ST_CACHE.get(uri)
+                    _ST_CACHE[uri] = (new_result_id, new_data)
+
+                # If previousResultId matches our cache, return a delta.
+                # Otherwise return a full response (client will resync).
+                if cached and cached[0] == previous_result_id:
+                    old_data = cached[1]
+                    edits = _compute_st_delta(old_data, new_data)
+                    return {"resultId": new_result_id, "edits": edits}
+                else:
+                    # Cache miss or first request after server restart:
+                    # return full tokens so the client resyncs correctly.
+                    return {"resultId": new_result_id, "data": new_data}
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: semanticTokens/full/delta: %s", exc)
+                return {"edits": []}
+
+        def _semantic_tokens_range(params) -> dict:
+            if not isinstance(params, dict):
+                return {"data": []}
+            uri = (params.get("textDocument") or {}).get("uri")
+            if not uri:
+                return {"data": []}
+            rng = params.get("range") or {}
+            start_line = (rng.get("start") or {}).get("line", 0)
+            end_line = (rng.get("end") or {}).get("line", 10 ** 9)
+            try:
+                document = workspace.get_document(uri)
+                return {
+                    "data": _get_semantic_tokens(
+                        document.source, document.path,
+                        start_line=start_line, end_line=end_line,
+                    ),
+                }
+            except Exception as exc:
+                log.error("pylsp_workspace_symbols: semanticTokens/range: %s", exc)
+                return {"data": []}
+
+        dispatch["textDocument/semanticTokens/full"] = _semantic_tokens_full
+        dispatch["textDocument/semanticTokens/full/delta"] = _semantic_tokens_full_delta
+        dispatch["textDocument/semanticTokens/range"] = _semantic_tokens_range
+
     return dispatch
 
 
@@ -457,19 +725,29 @@ def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict
                 continue
 
             uri = uris.from_fs_path(str(module_path))
-            line = max(0, (name.line or 1) - 1)   # Jedi 1-based -> LSP 0-based
-            col = max(0, (name.column or 0))
 
-            results.append({
-                "name": name.name,
-                "kind": _SYMBOL_KIND.get(name.type, _DEFAULT_KIND),
-                "location": {
+            # LSP 3.17: WorkspaceSymbol.location may be {uri} without range
+            # when the exact position is unknown.  Jedi always provides line/col
+            # so we always emit a full Location; the {uri}-only form is kept as
+            # a documented fallback in case Jedi returns None for both.
+            if name.line is not None:
+                line = max(0, (name.line or 1) - 1)   # Jedi 1-based -> LSP 0-based
+                col = max(0, (name.column or 0))
+                location: dict = {
                     "uri": uri,
                     "range": {
                         "start": {"line": line, "character": col},
                         "end": {"line": line, "character": col + len(name.name)},
                     },
-                },
+                }
+            else:
+                # LSP 3.17 allows omitting range when position is unavailable
+                location = {"uri": uri}
+
+            results.append({
+                "name": name.name,
+                "kind": _SYMBOL_KIND.get(name.type, _DEFAULT_KIND),
+                "location": location,
                 "containerName": name.module_name,
             })
         except Exception:
@@ -477,6 +755,132 @@ def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict
             continue
 
     return results
+
+
+def _get_semantic_tokens(
+    source: str,
+    path: str,
+    start_line: int = 0,
+    end_line: int = 10 ** 9,
+) -> List[int]:
+    """Return the LSP semantic tokens data array for *source*.
+
+    Uses jedi.Script.get_names(all_scopes=True) for a single O(n) Jedi call
+    instead of one ``goto`` per token, keeping response time low even on large
+    files.
+
+    The returned flat integer list encodes tokens as 5-tuples of relative
+    offsets as required by LSP 3.16:
+        [deltaLine, deltaStartChar, length, tokenTypeIndex, tokenModifiersBitmask]
+    """
+    if _jedi is None:
+        return []
+
+    try:
+        script = _jedi.Script(code=source, path=path)
+        names = script.get_names(all_scopes=True, definitions=True, references=True)
+    except Exception:
+        log.exception("pylsp_workspace_symbols: get_names failed for %s", path)
+        return []
+
+    # Collect raw (line0, col, length, type_idx, mod_mask) tuples, sorted by
+    # position so we can compute deltas in a single pass.
+    raw: List[tuple] = []
+    for name in names:
+        if name.line is None or name.column is None:
+            continue
+
+        line0 = name.line - 1  # Jedi 1-based -> LSP 0-based
+        if line0 < start_line or line0 > end_line:
+            continue
+
+        jedi_type = name.type
+        st_type_name = _JEDI_TYPE_TO_ST.get(jedi_type)
+        if st_type_name is None:
+            continue
+        type_idx = _ST_TOKEN_TYPES.get(st_type_name)
+        if type_idx is None:
+            continue
+
+        # Build modifier bitmask
+        mod_mask = 0
+        if name.is_definition():
+            mod_mask |= 1 << _ST_TOKEN_MODIFIERS["definition"]
+            mod_mask |= 1 << _ST_TOKEN_MODIFIERS["declaration"]
+
+        # Detect async functions/methods via Jedi description
+        try:
+            desc = name.description or ""
+            if jedi_type == "function" and desc.startswith("def ") is False:
+                # description for async functions starts with "async def"
+                if "async" in desc.split()[:2]:
+                    mod_mask |= 1 << _ST_TOKEN_MODIFIERS["async"]
+        except Exception:
+            pass
+
+        # Detect defaultLibrary: builtins or stdlib top-level module
+        try:
+            mod_name = (name.module_name or "").split(".")[0]
+            if mod_name in _STDLIB_TOP:
+                mod_mask |= 1 << _ST_TOKEN_MODIFIERS["defaultLibrary"]
+        except Exception:
+            pass
+
+        raw.append((line0, name.column, len(name.name), type_idx, mod_mask))
+
+    # Sort by (line, col) - Jedi may return names out of order
+    raw.sort(key=lambda t: (t[0], t[1]))
+
+    # Encode as relative deltas
+    data: List[int] = []
+    prev_line = 0
+    prev_col = 0
+    for line0, col, length, type_idx, mod_mask in raw:
+        delta_line = line0 - prev_line
+        delta_col = col if delta_line > 0 else col - prev_col
+        data.extend([delta_line, delta_col, length, type_idx, mod_mask])
+        prev_line = line0
+        prev_col = col
+
+    return data
+
+
+def _st_next_result_id() -> str:
+    """Return a monotonically increasing opaque result ID string."""
+    with _ST_COUNTER_LOCK:
+        _ST_RESULT_ID_COUNTER[0] += 1
+        return str(_ST_RESULT_ID_COUNTER[0])
+
+
+def _compute_st_delta(old_data: List[int], new_data: List[int]) -> List[dict]:
+    """Compute SemanticTokensEdit[] from two flat integer token arrays.
+
+    Uses SequenceMatcher (Ratcliff/Obershelp) with autojunk=False to avoid
+    false "junk" detection on repeated integers (e.g. 0-deltas).
+
+    Each edit covers a contiguous changed span in the *old* array:
+        {"start": int, "deleteCount": int, "data": List[int]}
+    where "data" is absent (or empty) for pure deletions.
+    """
+    if old_data == new_data:
+        return []
+
+    matcher = SequenceMatcher(None, old_data, new_data, autojunk=False)
+    edits: List[dict] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        edit: dict = {
+            "start": i1,
+            "deleteCount": i2 - i1,
+        }
+        replacement = new_data[j1:j2]
+        if replacement:
+            edit["data"] = replacement
+        edits.append(edit)
+
+    return edits
 
 
 @dataclass
@@ -532,14 +936,15 @@ def _get_inlay_hints(source_code: str, path: str, settings: dict) -> List[dict]:
         return []
 
     try:
-        # Create or get cached Jedi Script
+        # Cache keyed by (path, source) so edits before save never return a
+        # stale Script.  jedi.Script is immutable - there is no way to update
+        # it in-place.
+        cache_key = (path, hash(source_code))
         with _CACHE_LOCK:
-            if path in _JEDI_CACHE:
-                script = _JEDI_CACHE[path]
-                # Update script with new source if needed (Jedi handles this internally)
-            else:
+            script = _JEDI_CACHE.get(cache_key)
+            if script is None:
                 script = _jedi.Script(code=source_code, path=path)
-                _JEDI_CACHE[path] = script
+                _JEDI_CACHE[cache_key] = script
 
         # Use Jedi-based hint collection
         hints = _collect_jedi_hints(script, source_code, settings)
@@ -549,7 +954,12 @@ def _get_inlay_hints(source_code: str, path: str, settings: dict) -> List[dict]:
         if max_hints > 0 and len(hints) > max_hints:
             hints = hints[:max_hints]
 
-        return [hint.to_hint() for hint in hints if hint.to_hint()]
+        results = []
+        for hint in hints:
+            rendered = hint.to_hint()
+            if rendered:
+                results.append(rendered)
+        return results
 
     except Exception as e:
         log.debug("pylsp_workspace_symbols: Jedi inlay hints failed for %s: %s", path, e)
@@ -855,7 +1265,10 @@ def _find_assign_hints(script: _jedi.Script, source_code: str, lines: List[str])
                 # RHS is a function/method call.
                 # Strategy A: function has explicit return annotation -> use it.
                 # Strategy B: no annotation -> infer result after closing ')'.
-                rhs_start = len(line) - len(line.lstrip()) + len(target) + 3
+                # Locate the '=' on this line dynamically to handle all spacing
+                # variants: "x = f()", "x=f()", "x =f()", "x= f()".
+                eq_pos = line.find('=', len(indent) + len(target))
+                rhs_start = eq_pos + 1 if eq_pos >= 0 else len(indent) + len(target) + 3
                 open_paren = line.find('(', rhs_start)
                 if open_paren > 0:
                     # Strategy A
@@ -1139,16 +1552,26 @@ def _format_jedi_type(definition) -> str:
 
 @hookimpl
 def pylsp_document_did_close(config, workspace, document):
-    """Clears the Jedi Script cache when the document is closed to avoid stale data."""
+    """Clears the Jedi Script and code lens caches when the document is closed."""
     with _CACHE_LOCK:
-        _JEDI_CACHE.pop(document.path, None)
+        stale = [k for k in _JEDI_CACHE if k[0] == document.path]
+        for k in stale:
+            del _JEDI_CACHE[k]
+    uri = uris.from_fs_path(document.path)
+    with _CL_CACHE_LOCK:
+        _CL_CACHE.pop(uri, None)
 
 
 @hookimpl
 def pylsp_document_did_save(config, workspace, document):
-    """Clears the cache on save to ensure up-to-date types."""
+    """Clears the caches on save to ensure up-to-date results."""
     with _CACHE_LOCK:
-        _JEDI_CACHE.pop(document.path, None)
+        stale = [k for k in _JEDI_CACHE if k[0] == document.path]
+        for k in stale:
+            del _JEDI_CACHE[k]
+    uri = uris.from_fs_path(document.path)
+    with _CL_CACHE_LOCK:
+        _CL_CACHE.pop(uri, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1292,6 +1715,17 @@ def _call_hierarchy_incoming(item: dict, workspace) -> List[dict]:
 
         calls: List[dict] = []
         seen: set = set()
+        # Cache file contents within this call to avoid reading the same file
+        # twice - once for the import-check and once for get_context.
+        _file_cache: Dict[str, str] = {}
+
+        def _read_file(p: str) -> str:
+            if p not in _file_cache:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    _file_cache[p] = fh.read()
+            return _file_cache[p]
+
+        import ast as _ast_chk  # hoisted out of the per-ref loop
 
         for ref in refs:
             if not ref.module_path:
@@ -1301,12 +1735,16 @@ def _call_hierarchy_incoming(item: dict, workspace) -> List[dict]:
             # Skip the definition line itself
             if str(ref.module_path) == path and ref.line == item_line:
                 continue
+
+            ref_path = str(ref.module_path)
+            ref_line = ref.line or 1
+            ref_col  = ref.column or 0
+
             # Skip import statements - they are not call sites.
-            # ref.type is unreliable for this; use AST on the source line instead.
+            # ref.type is unreliable; check the AST of the individual line.
             try:
-                import ast as _ast_chk
-                ref_src_lines = open(str(ref.module_path), encoding="utf-8", errors="replace").read().splitlines()
-                ref_src_line = ref_src_lines[(ref.line or 1) - 1] if ref.line else ""
+                ref_src_lines = _read_file(ref_path).splitlines()
+                ref_src_line = ref_src_lines[ref_line - 1] if ref_line <= len(ref_src_lines) else ""
                 _node = _ast_chk.parse(ref_src_line.strip(), mode="single")
                 if any(isinstance(n, (_ast_chk.Import, _ast_chk.ImportFrom))
                        for n in _ast_chk.walk(_node)):
@@ -1314,18 +1752,14 @@ def _call_hierarchy_incoming(item: dict, workspace) -> List[dict]:
             except Exception:
                 pass
 
-            ref_path = str(ref.module_path)
-            ref_line = ref.line or 1
-            ref_col = ref.column or 0
             key = (ref_path, ref_line, ref_col)
             if key in seen:
                 continue
             seen.add(key)
 
-            # Resolve the enclosing caller
+            # Resolve the enclosing caller - reuse already-read source.
             try:
-                with open(ref_path, encoding="utf-8", errors="replace") as fh:
-                    ref_source = fh.read()
+                ref_source = _read_file(ref_path)
                 ref_script = _jedi.Script(code=ref_source, path=ref_path)
                 ctx = ref_script.get_context(line=ref_line, column=ref_col)
                 if ctx and ctx.type in ("function", "class") and ctx.module_path:
@@ -1466,6 +1900,9 @@ def _type_hierarchy_subtypes(item: dict, workspace) -> List[dict]:
 
         subtypes: List[dict] = []
         seen: set = set()
+        # Avoid re-reading and re-parsing the same file for multiple refs.
+        _src_cache: Dict[str, str] = {}
+        _script_cache: Dict[str, Any] = {}
 
         for ref in refs:
             if not ref.module_path:
@@ -1479,8 +1916,10 @@ def _type_hierarchy_subtypes(item: dict, workspace) -> List[dict]:
             ref_line = ref.line or 1
 
             try:
-                with open(ref_path, encoding="utf-8", errors="replace") as fh:
-                    ref_src = fh.read()
+                if ref_path not in _src_cache:
+                    with open(ref_path, encoding="utf-8", errors="replace") as fh:
+                        _src_cache[ref_path] = fh.read()
+                ref_src = _src_cache[ref_path]
                 ref_tree = _ast.parse(ref_src)
 
                 for node in _ast.walk(ref_tree):
@@ -1494,9 +1933,12 @@ def _type_hierarchy_subtypes(item: dict, workspace) -> List[dict]:
                         continue
                     seen.add(key)
 
-                    # Resolve the subclass name via Jedi for rich data
+                    # Resolve the subclass name via Jedi for rich data.
+                    # Reuse Script for the same file across multiple nodes.
                     try:
-                        rs = _jedi.Script(code=ref_src, path=ref_path)
+                        if ref_path not in _script_cache:
+                            _script_cache[ref_path] = _jedi.Script(code=ref_src, path=ref_path)
+                        rs = _script_cache[ref_path]
                         targets = rs.goto(
                             line=node.lineno,
                             column=node.col_offset + len("class "),
@@ -2119,6 +2561,396 @@ def _hsl_to_rgb(h_deg: float, s_pct: float, l_pct: float) -> tuple:
     )
 
 
+def _rgb_to_hsl(r: float, g: float, b: float) -> tuple:
+    """Convert (r, g, b) in 0.0-1.0 to (h_deg, s_pct, l_pct)."""
+    cmax = max(r, g, b)
+    cmin = min(r, g, b)
+    delta = cmax - cmin
+    l = (cmax + cmin) / 2.0
+
+    if delta == 0.0:
+        h = 0.0
+        s = 0.0
+    else:
+        s = delta / (1.0 - abs(2.0 * l - 1.0))
+        if cmax == r:
+            h = 60.0 * (((g - b) / delta) % 6.0)
+        elif cmax == g:
+            h = 60.0 * ((b - r) / delta + 2.0)
+        else:
+            h = 60.0 * ((r - g) / delta + 4.0)
+
+    return (round(h % 360.0, 1), round(s * 100.0, 1), round(l * 100.0, 1))
+
+
+def _color_presentations(color: dict, range_: dict, context_text: str) -> List[dict]:
+    """Build ColorPresentation[] for textDocument/colorPresentation.
+
+    Returns representations in order of likely preference, inferring the
+    format the user is already using from *context_text* (the text currently
+    in the requested range) so the best match is listed first.
+
+    Formats returned:
+      1. Hex (#rrggbb / #rrggbbaa)
+      2. rgb() / rgba()
+      3. hsl() / hsla()
+      4. Integer tuple (r_int, g_int, b_int[, a_int])
+      5. Named CSS color (only when exact match exists)
+    """
+    r = max(0.0, min(1.0, color.get("red",   0.0)))
+    g = max(0.0, min(1.0, color.get("green", 0.0)))
+    b = max(0.0, min(1.0, color.get("blue",  0.0)))
+    a = max(0.0, min(1.0, color.get("alpha", 1.0)))
+
+    ri = round(r * 255)
+    gi = round(g * 255)
+    bi = round(b * 255)
+    ai = round(a * 255)
+
+    has_alpha = a < 1.0
+
+    # --- build all representations ---
+
+    # Hex
+    if has_alpha:
+        hex_str = f"#{ri:02x}{gi:02x}{bi:02x}{ai:02x}"
+    else:
+        hex_str = f"#{ri:02x}{gi:02x}{bi:02x}"
+
+    # rgb / rgba
+    if has_alpha:
+        rgb_str = f"rgba({ri}, {gi}, {bi}, {round(a, 3)})"
+    else:
+        rgb_str = f"rgb({ri}, {gi}, {bi})"
+
+    # hsl / hsla
+    h_deg, s_pct, l_pct = _rgb_to_hsl(r, g, b)
+    if has_alpha:
+        hsl_str = f"hsla({h_deg}, {s_pct}%, {l_pct}%, {round(a, 3)})"
+    else:
+        hsl_str = f"hsl({h_deg}, {s_pct}%, {l_pct}%)"
+
+    # Integer tuple
+    if has_alpha:
+        tuple_str = f"({ri}, {gi}, {bi}, {ai})"
+    else:
+        tuple_str = f"({ri}, {gi}, {bi})"
+
+    # Named color (exact RGB match, alpha must be 1.0)
+    named: Optional[str] = None
+    if not has_alpha:
+        for name, rgba in _CSS_COLORS.items():
+            if (
+                abs(rgba[0] - r) < 0.002
+                and abs(rgba[1] - g) < 0.002
+                and abs(rgba[2] - b) < 0.002
+            ):
+                named = name
+                break
+
+    # Infer current format from context_text to sort best match first
+    ctx = (context_text or "").strip().lower()
+    if ctx.startswith("#"):
+        order = [hex_str, rgb_str, hsl_str, tuple_str]
+    elif ctx.startswith("rgb"):
+        order = [rgb_str, hex_str, hsl_str, tuple_str]
+    elif ctx.startswith("hsl"):
+        order = [hsl_str, hex_str, rgb_str, tuple_str]
+    elif ctx.startswith("("):
+        order = [tuple_str, hex_str, rgb_str, hsl_str]
+    elif named and ctx == named:
+        order = [named, hex_str, rgb_str, hsl_str, tuple_str]
+    else:
+        order = [hex_str, rgb_str, hsl_str, tuple_str]
+
+    if named and named not in order:
+        order.append(named)
+
+    def _make_presentation(label: str) -> dict:
+        return {
+            "label": label,
+            "textEdit": {
+                "range": range_,
+                "newText": label,
+            },
+        }
+
+    return [_make_presentation(label) for label in order if label]
+
+
+# ---------------------------------------------------------------------------
+# Code lens helpers
+# ---------------------------------------------------------------------------
+
+# (uri, source_hash) -> List[CodeLens dict]
+_CL_CACHE: Dict[str, tuple] = {}
+_CL_CACHE_LOCK = threading.Lock()
+
+
+def _cl_cache_get(uri: str, source_hash: str) -> Optional[List[dict]]:
+    with _CL_CACHE_LOCK:
+        entry = _CL_CACHE.get(uri)
+        if entry and entry[0] == source_hash:
+            return entry[1]
+    return None
+
+
+def _cl_cache_set(uri: str, source_hash: str, lenses: List[dict]) -> None:
+    with _CL_CACHE_LOCK:
+        _CL_CACHE[uri] = (source_hash, lenses)
+
+
+def _get_code_lenses(
+    source: str,
+    path: str,
+    uri: str,
+    settings: dict,
+    workspace_root: Optional[str] = None,
+) -> List[dict]:
+    """Compute CodeLens[] for *source*.
+
+    Strategy:
+      1. Fast structural pass with ``ast`` to locate top-level and class-level
+         definitions (functions, methods, classes) and special blocks.
+         Also builds two maps for implementations counting (intra-file):
+           - ``class_subclasses``: class_name -> count of direct subclasses
+             defined in this file (used for the class-level lens).
+           - ``method_overrides``: (class_name, method_name) -> count of
+             subclasses in this file that define the same method (overrides).
+      2. For each definition:
+         a. Call ``jedi.Script.get_references()`` to count call sites
+            (refs where ``is_definition() == False``).
+         b. For classes/methods: count implementations/overrides from the
+            intra-file map AND from Jedi cross-file subtype traversal.
+      3. Emit lenses in order: references → implementations → run/test.
+
+    Lens types produced:
+      - ``👥 N references``     - every top-level/class function, method, class
+      - ``🔗 N implementations`` - classes that have subclasses; methods that
+                                   are overridden in at least one subclass
+      - ``▶ Run``               - ``if __name__ == "__main__":`` block
+      - ``🧪 Run test``         - ``def test_*`` functions and ``Test*`` classes
+    """
+    import ast as _ast
+
+    source_hash = str(hash(source))
+    cached = _cl_cache_get(uri, source_hash)
+    if cached is not None:
+        return cached
+
+    show_refs  = settings.get("show_references",    True)
+    show_impls = settings.get("show_implementations", True)
+    show_run   = settings.get("show_run",           True)
+    show_tests = settings.get("show_tests",         True)
+    max_defs   = settings.get("max_definitions",    150)
+
+    lenses: List[dict] = []
+
+    # -- structural pass ------------------------------------------------------
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return []
+
+    # Collect definitions: (line_0based, col, name, kind, parent_class_name)
+    # kind: "function" | "method" | "class" | "run" | "test_func" | "test_class"
+    # parent_class_name: name of the enclosing ClassDef for methods, else None.
+    defs: List[tuple] = []
+
+    # Single ast.walk pass builds both maps at once.
+    # class_bases:   child_class -> [base_name, ...]
+    # class_methods: class_name -> {method_name, ...}
+    class_bases: Dict[str, List[str]] = {}
+    class_methods: Dict[str, set] = {}
+
+    for top_node in _ast.walk(tree):
+        if isinstance(top_node, _ast.ClassDef):
+            class_bases[top_node.name] = [
+                b for b in (
+                    getattr(base, "id", getattr(base, "attr", ""))
+                    for base in top_node.bases
+                ) if b
+            ]
+            class_methods[top_node.name] = {
+                child.name
+                for child in top_node.body
+                if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+            }
+
+    # Intra-file subclass count per class name.
+    class_subclasses: Dict[str, int] = {}
+    for bases in class_bases.values():
+        for base in bases:
+            class_subclasses[base] = class_subclasses.get(base, 0) + 1
+
+    # method_overrides[(parent_class, method)] = count of subclasses that override it.
+    method_overrides: Dict[tuple, int] = {}
+    for child_class, bases in class_bases.items():
+        for base in bases:
+            child_meths = class_methods.get(child_class, set())
+            for meth in child_meths:
+                key = (base, meth)
+                method_overrides[key] = method_overrides.get(key, 0) + 1
+
+    # -- collect defs with parent_class context ------------------------------
+    for top_node in tree.body:
+        if isinstance(top_node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            keyword = "async def " if isinstance(top_node, _ast.AsyncFunctionDef) else "def "
+            col  = top_node.col_offset + len(keyword)
+            name = top_node.name
+            kind = "test_func" if (name.startswith("test_") or name.startswith("Test")) else "function"
+            defs.append((top_node.lineno - 1, col, name, kind, None))
+
+        elif isinstance(top_node, _ast.ClassDef):
+            col   = top_node.col_offset + len("class ")
+            name  = top_node.name
+            bases = [getattr(b, "id", getattr(b, "attr", "")) for b in top_node.bases]
+            kind  = "test_class" if (name.startswith("Test") or "TestCase" in bases) else "class"
+            defs.append((top_node.lineno - 1, col, name, kind, None))
+            # Collect methods inside this class
+            for child in top_node.body:
+                if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    kw = "async def " if isinstance(child, _ast.AsyncFunctionDef) else "def "
+                    mcol  = child.col_offset + len(kw)
+                    mname = child.name
+                    if mname.startswith("test_") or mname.startswith("Test"):
+                        mkind = "test_func"
+                    else:
+                        mkind = "method"
+                    defs.append((child.lineno - 1, mcol, mname, mkind, name))
+
+        elif isinstance(top_node, _ast.If):
+            test = top_node.test
+            is_main = (
+                isinstance(test, _ast.Compare)
+                and isinstance(test.left, _ast.Name)
+                and test.left.id == "__name__"
+                and any(
+                    isinstance(c, _ast.Constant) and c.value == "__main__"
+                    for c in test.comparators
+                )
+            )
+            if is_main:
+                defs.append((top_node.lineno - 1, 0, "__main__", "run", None))
+
+    # Cap to avoid excessive Jedi calls on very large files
+    defs = defs[:max_defs]
+
+    # -- Jedi script (shared for all symbols) --------------------------------
+    jedi_script = None
+    if _jedi is not None and (show_refs or show_impls):
+        try:
+            disk_source = source
+            if path:
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        disk_source = fh.read()
+                except OSError:
+                    pass
+            project = _jedi.Project(path=workspace_root) if workspace_root else None
+            jedi_script = _jedi.Script(code=disk_source, path=path, project=project)
+        except Exception as exc:
+            log.exception("pylsp_workspace_symbols: codeLens jedi.Script failed: %s", exc)
+
+
+    # -- pre-compute inheritance usage positions ------------------------------
+    # Maps (line_1based, col) -> base_name for every base-class usage in file.
+    # Used to exclude those positions from the 👥 references count - they
+    # belong to 🔗 implementations instead.
+    inheritance_positions: Dict[tuple, str] = {}
+    for top_node in tree.body:
+        if isinstance(top_node, _ast.ClassDef):
+            for base in top_node.bases:
+                base_name = getattr(base, "id", getattr(base, "attr", ""))
+                if base_name and hasattr(base, "col_offset"):
+                    inheritance_positions[(top_node.lineno, base.col_offset)] = base_name
+
+    # -- emit lenses ----------------------------------------------------------
+    for line0, col, name, kind, parent_class in defs:
+        line1 = line0 + 1  # Jedi is 1-based
+
+        lens_range = {
+            "start": {"line": line0, "character": col},
+            "end":   {"line": line0, "character": col + len(name)},
+        }
+
+        # -- fetch Jedi refs once per symbol ----------------------------------
+        jedi_refs: Optional[list] = None
+        if jedi_script is not None and kind not in ("run",):
+            try:
+                jedi_refs = jedi_script.get_references(line1, col, include_builtins=False)
+            except Exception as exc:
+                log.debug(
+                    "pylsp_workspace_symbols: codeLens get_references failed for %s:%s: %s",
+                    name, line1, exc,
+                )
+
+        # -- 👥 reference lens ------------------------------------------------
+        if show_refs and kind not in ("run",):
+            label = "👥 ? references"
+            if jedi_refs is not None:
+                non_def_refs = [r for r in jedi_refs if not r.is_definition()]
+                if kind in ("class", "test_class"):
+                    # Exclude inheritance positions: refs where (line, col)
+                    # matches a known base-class usage in the AST map.
+                    # Jedi returns these as type='statement'; filtering by
+                    # position is the only reliable way to exclude them.
+                    call_sites = [
+                        r for r in non_def_refs
+                        if (r.line, r.column) not in inheritance_positions
+                    ]
+                else:
+                    call_sites = non_def_refs
+                n = len(call_sites)
+                label = f"👥 {n} reference{'s' if n != 1 else ''}"
+            lenses.append({
+                "range": lens_range,
+                "command": {"title": label, "command": "", "arguments": []},
+            })
+
+        # -- 🔗 implementations lens ------------------------------------------
+        # Classes: AST map (class_subclasses) is the authoritative source.
+        #   Jedi get_references() returns inheritance usages as type='statement'
+        #   (not 'class'), so Jedi cross-file detection is unreliable here.
+        # Methods: AST map (method_overrides) is the authoritative source.
+        #   Jedi does not return override definitions as refs to the base method,
+        #   so Jedi cross-file detection is also unreliable here.
+        # Both only cover intra-file occurrences - acceptable for now.
+        if show_impls and kind in ("class", "test_class", "method"):
+            if kind in ("class", "test_class"):
+                n_impl = class_subclasses.get(name, 0)
+            else:
+                n_impl = method_overrides.get((parent_class, name), 0) if parent_class else 0
+
+            if n_impl > 0:
+                impl_label = f"🔗 {n_impl} implementation{'s' if n_impl != 1 else ''}"
+                lenses.append({
+                    "range": lens_range,
+                    "command": {"title": impl_label, "command": "", "arguments": []},
+                })
+
+        # -- ▶ Run lens -------------------------------------------------------
+        if show_run and kind == "run":
+            lenses.append({
+                "range": lens_range,
+                "command": {"title": "▶ Run", "command": "", "arguments": []},
+            })
+
+        # -- 🧪 Run test lens -------------------------------------------------
+        if show_tests and kind in ("test_func", "test_class"):
+            lenses.append({
+                "range": lens_range,
+                "command": {"title": "🧪 Run test", "command": "", "arguments": []},
+            })
+
+    log.info(
+        "pylsp_workspace_symbols: codeLens computed %d lens(es) for %s",
+        len(lenses), uri,
+    )
+    _cl_cache_set(uri, source_hash, lenses)
+    return lenses
+
+
 def _find_triple_string_spans(source: str) -> List[tuple]:
     """Return list of (start, end) char offsets for every triple-quoted string
     in *source*.  Used to decide whether a bare ``#`` is a Python comment or
@@ -2162,20 +2994,32 @@ def _strip_inline_comment(line: str, line_start_offset: int,
     A ``#`` that falls inside any triple-quoted string span is **not** treated
     as a comment delimiter.  Single- and double-quote context within the line
     is still tracked for the common case of quoted hex colors.
+
+    Performance: the triple-span membership test is hoisted out of the
+    per-character inner loop.  Instead of calling ``any(...)`` over all spans
+    for every character (O(len * spans)), we check once whether the line
+    overlaps any triple-quoted span at all, and if so mark which character
+    offsets on this line are shielded.  For the common case of no overlap the
+    fast path skips all span work entirely.
     """
+    line_end = line_start_offset + len(line)
+
+    # Fast path: line does not touch any triple-quoted span at all.
+    # This is true for the vast majority of lines in normal source files.
+    line_in_triple = any(ts < line_end and te > line_start_offset
+                         for ts, te in triple_spans)
+
     in_single = False
     in_double = False
     i = 0
     while i < len(line):
         ch = line[i]
-        abs_pos = line_start_offset + i
 
-        # If this character is inside a triple-quoted string, it cannot be
-        # a comment delimiter - consume without toggling quote state.
-        in_triple = any(ts <= abs_pos < te for ts, te in triple_spans)
-        if in_triple:
-            i += 1
-            continue
+        if line_in_triple:
+            abs_pos = line_start_offset + i
+            if any(ts <= abs_pos < te for ts, te in triple_spans):
+                i += 1
+                continue
 
         if ch == "'" and not in_double:
             in_single = not in_single
