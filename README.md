@@ -6,9 +6,9 @@
 [![Downloads](https://img.shields.io/pypi/dm/pylsp-workspace-symbols)](https://pypistats.org/packages/pylsp-workspace-symbols)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hanatarou/pylsp-workspace-symbols/blob/main/LICENSE)
 
-A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace symbol search**, **inlay hints**, **call/type hierarchy**, **document links** and **document colors** via [Jedi](https://github.com/davidhalter/jedi).
+A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace symbol search**, **inlay hints**, **code lens**, **semantic tokens**, **call/type hierarchy**, **document links** and **document colors** via [Jedi](https://github.com/davidhalter/jedi).
 
-> **Why?** `pylsp` does not implement several LSP features natively. This plugin fills those gaps — enabling "Go to Symbol in Workspace", rich type inference hints, call/type hierarchy navigation, clickable import links, and inline color previews in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others — with broad client compatibility out of the box.
+> **Why?** `pylsp` does not implement several LSP features natively. This plugin fills those gaps — enabling "Go to Symbol in Workspace", rich type inference hints, code lens overlays, semantic token highlighting, call/type hierarchy navigation, clickable import links, and inline color previews in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others — with broad client compatibility out of the box.
 
 ---
 
@@ -16,6 +16,8 @@ A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin th
 
 - 🔍 **Workspace-wide symbol search** — find functions, classes, and modules across all files in the project
 - 💡 **Inlay hints** — inline type annotations inferred by Jedi for assignments, return types, raised exceptions, and parameter names at call sites
+- 🔭 **Code lens** — per-definition overlays showing reference counts (`👥 N references`), subclass/override counts (`🔗 N implementations`), run entry points (`▶ Run`), and test markers (`🧪 Run test`)
+- 🎨 **Semantic tokens** — Jedi-backed token classification for editors that support `textDocument/semanticTokens` (opt-in, disabled by default)
 - 🌳 **Call hierarchy** — navigate callers and callees of any function via `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`
 - 🧬 **Type hierarchy** — explore supertypes and subtypes of any class via `typeHierarchy/supertypes` and `typeHierarchy/subtypes`
 - 🔗 **Document links** — clickable links for URLs in comments/strings and import statements (resolves to stdlib source when available)
@@ -56,6 +58,17 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
         "show_parameter_hints": true,
         "max_hints_per_file": 200
       },
+      "code_lens": {
+        "enabled": true,
+        "show_references": true,
+        "show_implementations": true,
+        "show_run": true,
+        "show_tests": true,
+        "max_definitions": 150
+      },
+      "semantic_tokens": {
+        "enabled": false
+      },
       "call_hierarchy": {
         "enabled": true
       },
@@ -91,6 +104,23 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
 | `show_raises` | bool | `true` | Show raised exception types (`raise ValueError(...)` → `Raises: ValueError`) |
 | `show_parameter_hints` | bool | `true` | Show parameter names at call sites (`f(1, 2)` → `a=1, b=2`) |
 | `max_hints_per_file` | int | `200` | Maximum hints per file. `0` means no limit |
+
+### Code lens options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable all code lenses |
+| `show_references` | bool | `true` | Show `👥 N references` above every function, method, and class |
+| `show_implementations` | bool | `true` | Show `🔗 N implementations` on classes with subclasses and methods with overrides |
+| `show_run` | bool | `true` | Show `▶ Run` above `if __name__ == "__main__":` blocks |
+| `show_tests` | bool | `true` | Show `🧪 Run test` above `test_*` functions and `Test*` classes |
+| `max_definitions` | int | `150` | Maximum number of definitions to process per file |
+
+### Semantic token options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Enable/disable semantic token highlighting. Opt-in — can be slow on very large files |
 
 ### Call hierarchy options
 
@@ -141,6 +171,29 @@ rendered inline by the client automatically. The following hint types are suppor
 Inlay hints respect type annotations already present in the source — annotated functions and
 variables are never hinted twice.
 
+### Code lens
+
+Your LSP client will receive `codeLensProvider: true`. The following overlays are shown above
+definitions:
+
+- **`👥 N references`** — every top-level function, method, and class. Inheritance usages
+  (`class Dog(Animal)`) are excluded from the reference count and counted as implementations instead.
+- **`🔗 N implementations`** — classes that have at least one direct subclass defined in the file;
+  methods that are overridden in at least one subclass defined in the file.
+- **`▶ Run`** — `if __name__ == "__main__":` entry point blocks.
+- **`🧪 Run test`** — `test_*` functions and `Test*` / `unittest.TestCase` subclasses.
+
+> **Note:** implementation counts are currently intra-file only. Cross-file subclass detection
+> requires Jedi project indexing which is not yet enabled for this feature.
+
+### Semantic tokens
+
+Your LSP client will receive `semanticTokensProvider` when `semantic_tokens.enabled` is `true`.
+Token types follow the standard LSP legend (`namespace`, `class`, `function`, `variable`,
+`parameter`, etc.) with modifiers for `definition`, `async`, and `defaultLibrary` names.
+Disabled by default — enable explicitly if your client supports it and you want Jedi-backed
+token classification in addition to your editor's built-in lexer.
+
 ### Call hierarchy
 
 Your LSP client will receive `callHierarchyProvider: true`. Place the cursor on any function name
@@ -176,6 +229,10 @@ hex (`#rgb`, `#rrggbb`, `#rrggbbaa`), `rgb()`/`rgba()`, `hsl()`/`hsla()`, and CS
 2. **Experimental fallback** — if the injection fails (e.g. pylsp changes its internal API), capabilities are announced via `pylsp_experimental_capabilities` instead. Clients that honour the experimental channel (CudaText, VSCode with pylsp, etc.) will still work.
 3. **`pylsp_dispatchers`** — registers a custom JSON-RPC handler for `workspace/symbol` that calls Jedi's `project.complete_search()` and filters results client-side by case-insensitive substring match.
 
+Results are **strictly limited to files inside the workspace root** — `complete_search()` indexes
+the full Python environment (stdlib, site-packages) but every result is validated against the
+workspace root via `Path.relative_to()` before being returned.
+
 > **Note:** `workspace/symbol` returns module-level definitions (functions, classes, modules).
 > Local variables inside functions are not indexed — this is standard LSP behaviour,
 > consistent with pyright and other Python language servers.
@@ -188,6 +245,19 @@ The plugin handles the `textDocument/inlayHint` request using a hybrid approach:
 2. **`_literal_type` fast-path** — resolves common literals (`"str"`, `42`, `True`, `[...]`, etc.) without calling Jedi.
 3. **Jedi inference** — for non-literal expressions, `script.infer()` and `script.get_signatures()` are used to resolve types.
 4. **Signature fallback** — for `self.attr = param` assignments, the enclosing `def` signature is inspected for type annotations or default values.
+
+### Code lens
+
+Handled via the native `pylsp_code_lens` hookspec. Uses a two-pass approach:
+
+1. **AST pass** — single `ast.walk` over the file to collect all definitions and build intra-file maps of subclass relationships (`class_subclasses`) and method overrides (`method_overrides`). Also pre-computes inheritance usage positions to correctly separate reference counts from implementation counts.
+2. **Jedi reference pass** — one `script.get_references()` call per definition to count non-definition references. Results are cached by `(uri, hash(source))` so repeated requests on an unchanged file skip all work.
+
+### Semantic tokens
+
+Handled via `textDocument/semanticTokens/full`, `full/delta`, and `range` dispatchers. Uses
+`jedi.Script.get_names(all_scopes=True)` for a single O(n) pass — no per-token `goto` calls.
+Delta computation uses `SequenceMatcher` to produce minimal `SemanticTokensEdit[]` arrays.
 
 ### Call hierarchy
 
@@ -229,6 +299,8 @@ Please open an issue before submitting a large change.
 - [Jedi](https://github.com/davidhalter/jedi)
 - [LSP workspace/symbol specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_symbol)
 - [LSP inlay hints specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_inlayHint)
+- [LSP code lens specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_codeLens)
+- [LSP semantic tokens specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_semanticTokens)
 - [LSP call hierarchy specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareCallHierarchy)
 - [LSP type hierarchy specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareTypeHierarchy)
 - [LSP document links specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_documentLink)
