@@ -477,3 +477,154 @@ class TestDispatcherFeatureRegistration:
         d = pylsp_dispatchers(self._cfg({"document_colors": {"enabled": False}}), _make_workspace())
         assert "textDocument/documentColor" not in d
         assert "textDocument/colorPresentation" not in d
+
+
+# ---------------------------------------------------------------------------
+# pylsp_settings - cross_file_implementations
+# ---------------------------------------------------------------------------
+
+class TestCrossFileImplementationsSetting:
+    def test_default_is_false(self):
+        cfg = MagicMock()
+        result = pylsp_settings(cfg)
+        cl = result["plugins"]["code_lens"]
+        assert cl["cross_file_implementations"] is False
+
+    def test_other_code_lens_defaults_unchanged(self):
+        cfg = MagicMock()
+        cl = pylsp_settings(cfg)["plugins"]["code_lens"]
+        assert cl["show_references"] is True
+        assert cl["show_implementations"] is True
+        assert cl["show_run"] is True
+        assert cl["show_tests"] is True
+        assert cl["max_definitions"] == 150
+
+
+# ---------------------------------------------------------------------------
+# pylsp_code_lens - run/test commands
+# ---------------------------------------------------------------------------
+
+class TestCodeLensCommands:
+    def _make_doc(self, source, path="/tmp/project/mod.py"):
+        doc = MagicMock()
+        doc.source = source
+        doc.path = path
+        doc.uri = f"file://{path}"
+        return doc
+
+    def _make_cfg(self):
+        cfg = MagicMock()
+        cfg.plugin_settings.return_value = {
+            "enabled": True,
+            "show_references": True,
+            "show_implementations": True,
+            "cross_file_implementations": False,
+            "show_run": True,
+            "show_tests": True,
+            "max_definitions": 150,
+        }
+        return cfg
+
+    def test_run_lens_has_real_command(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        source = 'if __name__ == "__main__":\n    pass\n'
+        doc = self._make_doc(source)
+        result = pylsp_code_lens(self._make_cfg(), _make_workspace(), doc)
+        run_lenses = [l for l in result if "▶" in l["command"]["title"]]
+        assert len(run_lenses) == 1
+        assert run_lenses[0]["command"]["command"] == "pylsp_workspace_symbols.run_file"
+        assert run_lenses[0]["command"]["arguments"][0]["path"] == doc.path
+
+    def test_run_test_lens_has_real_command_for_function(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        source = "def test_something():\n    assert True\n"
+        doc = self._make_doc(source)
+        result = pylsp_code_lens(self._make_cfg(), _make_workspace(), doc)
+        test_lenses = [l for l in result if "Run test" in l["command"]["title"]]
+        assert len(test_lenses) == 1
+        cmd = test_lenses[0]["command"]
+        assert cmd["command"] == "pylsp_workspace_symbols.run_test"
+        args = cmd["arguments"][0]
+        assert args["path"] == doc.path
+        assert args["name"] == "test_something"
+        assert args["kind"] == "function"
+
+    def test_run_test_lens_has_real_command_for_class(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        import unittest as _ut
+        source = "import unittest\nclass TestFoo(unittest.TestCase):\n    pass\n"
+        doc = self._make_doc(source)
+        result = pylsp_code_lens(self._make_cfg(), _make_workspace(), doc)
+        test_lenses = [l for l in result if "Run test" in l["command"]["title"]]
+        assert any(l["command"]["arguments"][0]["kind"] == "class" for l in test_lenses)
+
+
+# ---------------------------------------------------------------------------
+# _find_cross_file_subclasses
+# ---------------------------------------------------------------------------
+
+class TestFindCrossFileSubclasses:
+    def test_returns_empty_when_jedi_unavailable(self):
+        from pylsp_workspace_symbols.plugin import _find_cross_file_subclasses
+        with patch("pylsp_workspace_symbols.plugin._jedi", None):
+            result = _find_cross_file_subclasses("/tmp/x.py", 1, 0, "/tmp")
+        assert result == []
+
+    def test_returns_empty_on_missing_file(self):
+        from pylsp_workspace_symbols.plugin import _find_cross_file_subclasses
+        result = _find_cross_file_subclasses("/nonexistent/file.py", 1, 0, "/nonexistent")
+        assert result == []
+
+    def test_returns_list_type(self):
+        from pylsp_workspace_symbols.plugin import _find_cross_file_subclasses
+        # Valid call with real workspace - should return a list (possibly empty)
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            src = tmp + "/base.py"
+            open(src, "w").write("class Base:\n    pass\n")
+            result = _find_cross_file_subclasses(src, 1, 6, tmp)
+        assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
+# cross_file_implementations in code lens (integration)
+# ---------------------------------------------------------------------------
+
+class TestCrossFileImplementationsLens:
+    def _make_cfg(self, cross_file=False):
+        cfg = MagicMock()
+        cfg.plugin_settings.return_value = {
+            "enabled": True,
+            "show_references": True,
+            "show_implementations": True,
+            "cross_file_implementations": cross_file,
+            "show_run": True,
+            "show_tests": True,
+            "max_definitions": 150,
+        }
+        return cfg
+
+    def _make_doc(self, source, path="/tmp/project/base.py"):
+        doc = MagicMock()
+        doc.source = source
+        doc.path = path
+        doc.uri = f"file://{path}"
+        return doc
+
+    def test_intra_file_implementations_always_counted(self):
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        source = "class Base:\n    pass\n\nclass Child(Base):\n    pass\n"
+        doc = self._make_doc(source)
+        result = pylsp_code_lens(self._make_cfg(cross_file=False), _make_workspace(), doc)
+        impl_lenses = [l for l in result if "implementation" in l["command"]["title"]]
+        assert any("1" in l["command"]["title"] for l in impl_lenses)
+
+    def test_cross_file_disabled_no_extra_io(self):
+        """With cross_file=False, _find_cross_file_subclasses should never be called."""
+        from pylsp_workspace_symbols import plugin
+        from pylsp_workspace_symbols.plugin import pylsp_code_lens
+        source = "class Base:\n    pass\n"
+        doc = self._make_doc(source)
+        with patch.object(plugin, "_find_cross_file_subclasses", wraps=plugin._find_cross_file_subclasses) as mock_cf:
+            pylsp_code_lens(self._make_cfg(cross_file=False), _make_workspace(), doc)
+            mock_cf.assert_not_called()
