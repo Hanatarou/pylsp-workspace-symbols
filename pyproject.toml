@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pylsp-workspace-symbols"
-version = "0.4.0"
+version = "0.5.0"
 description = "Workspace symbols, inlay hints, code lens, semantic tokens, call/type hierarchy, document links and colors for python-lsp-server via Jedi"
 readme = "README.md"
 license = { text = "MIT" }
