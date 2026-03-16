@@ -62,6 +62,7 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
         "enabled": true,
         "show_references": true,
         "show_implementations": true,
+        "cross_file_implementations": false,
         "show_run": true,
         "show_tests": true,
         "max_definitions": 150
@@ -112,6 +113,7 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
 | `enabled` | bool | `true` | Enable/disable all code lenses |
 | `show_references` | bool | `true` | Show `👥 N references` above every function, method, and class |
 | `show_implementations` | bool | `true` | Show `🔗 N implementations` on classes with subclasses and methods with overrides |
+| `cross_file_implementations` | bool | `false` | Extend `🔗` counts to subclasses/overrides in other files. Opt-in — adds one `get_references()` call + file I/O per class/method |
 | `show_run` | bool | `true` | Show `▶ Run` above `if __name__ == "__main__":` blocks |
 | `show_tests` | bool | `true` | Show `🧪 Run test` above `test_*` functions and `Test*` classes |
 | `max_definitions` | int | `150` | Maximum number of definitions to process per file |
@@ -178,13 +180,14 @@ definitions:
 
 - **`👥 N references`** — every top-level function, method, and class. Inheritance usages
   (`class Dog(Animal)`) are excluded from the reference count and counted as implementations instead.
-- **`🔗 N implementations`** — classes that have at least one direct subclass defined in the file;
-  methods that are overridden in at least one subclass defined in the file.
+  Cross-file inheritance usages are also excluded when `cross_file_implementations=true`.
+- **`🔗 N implementations`** — classes with direct subclasses; methods overridden in at least one
+  subclass. Intra-file always; cross-file when `cross_file_implementations=true` (opt-in).
 - **`▶ Run`** — `if __name__ == "__main__":` entry point blocks.
+  Fires `workspace/executeCommand` with command `pylsp_workspace_symbols.run_file`.
 - **`🧪 Run test`** — `test_*` functions and `Test*` / `unittest.TestCase` subclasses.
-
-> **Note:** implementation counts are currently intra-file only. Cross-file subclass detection
-> requires Jedi project indexing which is not yet enabled for this feature.
+  Fires `workspace/executeCommand` with command `pylsp_workspace_symbols.run_test`,
+  passing `{"path": ..., "name": ..., "kind": "function"|"class"}` as arguments.
 
 ### Semantic tokens
 
@@ -229,9 +232,11 @@ hex (`#rgb`, `#rrggbb`, `#rrggbbaa`), `rgb()`/`rgba()`, `hsl()`/`hsla()`, and CS
 2. **Experimental fallback** — if the injection fails (e.g. pylsp changes its internal API), capabilities are announced via `pylsp_experimental_capabilities` instead. Clients that honour the experimental channel (CudaText, VSCode with pylsp, etc.) will still work.
 3. **`pylsp_dispatchers`** — registers a custom JSON-RPC handler for `workspace/symbol` that calls Jedi's `project.complete_search()` and filters results client-side by case-insensitive substring match.
 
-Results are **strictly limited to files inside the workspace root** — `complete_search()` indexes
-the full Python environment (stdlib, site-packages) but every result is validated against the
-workspace root via `Path.relative_to()` before being returned.
+Results are **strictly limited to files inside the workspace root**. The project is initialized
+with `sys_path=[workspace_root]`, which restricts Jedi's indexing to the workspace directory only
+— avoiding the full Python environment (stdlib + site-packages). This yields an ~80x speedup on
+`complete_search` compared to the default Jedi project. A `relative_to()` guard provides a
+second layer of filtering for the small number of typeshed stubs that still appear.
 
 > **Note:** `workspace/symbol` returns module-level definitions (functions, classes, modules).
 > Local variables inside functions are not indexed — this is standard LSP behaviour,
@@ -250,8 +255,20 @@ The plugin handles the `textDocument/inlayHint` request using a hybrid approach:
 
 Handled via the native `pylsp_code_lens` hookspec. Uses a two-pass approach:
 
-1. **AST pass** — single `ast.walk` over the file to collect all definitions and build intra-file maps of subclass relationships (`class_subclasses`) and method overrides (`method_overrides`). Also pre-computes inheritance usage positions to correctly separate reference counts from implementation counts.
-2. **Jedi reference pass** — one `script.get_references()` call per definition to count non-definition references. Results are cached by `(uri, hash(source))` so repeated requests on an unchanged file skip all work.
+1. **AST pass** — single `ast.walk` over the file to collect all definitions and build intra-file
+   maps of subclass relationships (`class_subclasses`) and method overrides (`method_overrides`).
+   Also pre-computes inheritance usage positions (intra-file) to correctly separate reference
+   counts from implementation counts.
+2. **Jedi reference pass** — one `script.get_references()` call per definition to count
+   non-definition references. Cross-file inheritance positions are excluded from the reference
+   count using `_find_cross_file_subclasses` (only when `cross_file_implementations=True`).
+   Results are cached by `(uri, hash(source))` so repeated requests on an unchanged file skip
+   all work.
+
+When `cross_file_implementations=True`, `_find_cross_file_subclasses` uses
+`script.get_references()` with the workspace project to find subclasses in other files,
+verifying each ref against the AST of the referenced file. A per-request `_cf_subclass_cache`
+ensures the I/O is shared between the references filter and the implementations count.
 
 ### Semantic tokens
 
