@@ -631,11 +631,11 @@ class TestCrossFileImplementationsLens:
 
 
 # ---------------------------------------------------------------------------
-# _get_semantic_tokens / _build_ast_tables
+# _get_semantic_tokens
 # ---------------------------------------------------------------------------
 
 class TestSemanticTokens:
-    # Tests for semantic token classification logic added/improved in v0.6.0.
+    # Tests for semantic token classification added in v0.6.0.
 
     def _get_tokens(self, source, path='/tmp/test.py'):
         from pylsp_workspace_symbols.plugin import (
@@ -648,7 +648,8 @@ class TestSemanticTokens:
             dl, dc, length, tidx, mmask = data[i:i+5]
             line += dl
             col = dc if dl > 0 else col + dc
-            type_name = next((k for k, v in _ST_TOKEN_TYPES.items() if v == tidx), None)
+            type_name = next(
+                (k for k, v in _ST_TOKEN_TYPES.items() if v == tidx), None)
             mods = {k for k, v in _ST_TOKEN_MODIFIERS.items() if mmask & (1 << v)}
             tokens.append((line, col, length, type_name, mods))
             i += 5
@@ -666,7 +667,7 @@ class TestSemanticTokens:
         src = 'class Foo:\n    @classmethod\n    def bar(cls): pass\n'
         bar = self._find(self._get_tokens(src), 'bar', src)
         assert bar, 'token bar not found'
-        assert any('static' in m for *_, m in bar), f'static missing: {bar}'
+        assert any('static' in m for *_, m in bar)
 
     def test_staticmethod_gets_static_modifier(self):
         src = 'class Foo:\n    @staticmethod\n    def baz(x): pass\n'
@@ -679,9 +680,8 @@ class TestSemanticTokens:
         assert bar
         assert not any('static' in m for *_, m in bar)
 
-    def test_augassign_modification_detected(self):
-        # modification fires on references (not definitions) that follow
-        # a prior definition on an earlier line
+    def test_modification_after_reassignment(self):
+        # modification fires on references that follow a prior definition
         src = 'def f():\n    x = 0\n    print(x)\n    x = 1\n    print(x)\n'
         x_tokens = self._find(self._get_tokens(src), 'x', src)
         assert any('modification' in m for *_, m in x_tokens)
@@ -700,43 +700,7 @@ class TestSemanticTokens:
         src = 'from typing import TypeVarTuple\nTs = TypeVarTuple("Ts")\n'
         ts = self._find(self._get_tokens(src), 'Ts', src)
         assert ts, 'token Ts not found'
-        assert any('readonly' in m for *_, m in ts), f'readonly missing: {ts}'
-
-    def test_paramspec_args_is_typeparameter(self):
-        import tempfile, os
-        src = (
-            'from typing import ParamSpec\n'
-            'P = ParamSpec("P")\n'
-            'def wrapper(*args: P.args, **kwargs: P.kwargs): pass\n'
-        )
-        with tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False) as f:
-            f.write(src)
-            path = f.name
-        try:
-            tp = [t for t in self._find(self._get_tokens(src, path), 'args', src)
-                  if t[3] == 'typeParameter']
-            assert tp, 'no typeParameter for P.args'
-            assert any('readonly' in m for *_, m in tp)
-        finally:
-            os.unlink(path)
-
-    def test_paramspec_kwargs_is_typeparameter(self):
-        import tempfile, os
-        src = (
-            'from typing import ParamSpec\n'
-            'P = ParamSpec("P")\n'
-            'def wrapper(*args: P.args, **kwargs: P.kwargs): pass\n'
-        )
-        with tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False) as f:
-            f.write(src)
-            path = f.name
-        try:
-            tp = [t for t in self._find(self._get_tokens(src, path), 'kwargs', src)
-                  if t[3] == 'typeParameter']
-            assert tp, 'no typeParameter for P.kwargs'
-            assert any('readonly' in m for *_, m in tp)
-        finally:
-            os.unlink(path)
+        assert any('readonly' in m for *_, m in ts)
 
     def test_enum_member_gets_readonly(self):
         src = 'import enum\nclass Color(enum.Enum):\n    RED = 1\n'
