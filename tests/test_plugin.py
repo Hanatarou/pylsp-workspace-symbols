@@ -628,3 +628,115 @@ class TestCrossFileImplementationsLens:
         with patch.object(plugin, "_find_cross_file_subclasses", wraps=plugin._find_cross_file_subclasses) as mock_cf:
             pylsp_code_lens(self._make_cfg(cross_file=False), _make_workspace(), doc)
             mock_cf.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _get_semantic_tokens / _build_ast_tables
+# ---------------------------------------------------------------------------
+
+class TestSemanticTokens:
+    # Tests for semantic token classification logic added/improved in v0.6.0.
+
+    def _get_tokens(self, source, path='/tmp/test.py'):
+        from pylsp_workspace_symbols.plugin import (
+            _get_semantic_tokens, _ST_TOKEN_TYPES, _ST_TOKEN_MODIFIERS)
+        data = _get_semantic_tokens(source, path)
+        tokens = []
+        line = col = 0
+        i = 0
+        while i + 5 <= len(data):
+            dl, dc, length, tidx, mmask = data[i:i+5]
+            line += dl
+            col = dc if dl > 0 else col + dc
+            type_name = next((k for k, v in _ST_TOKEN_TYPES.items() if v == tidx), None)
+            mods = {k for k, v in _ST_TOKEN_MODIFIERS.items() if mmask & (1 << v)}
+            tokens.append((line, col, length, type_name, mods))
+            i += 5
+        return tokens
+
+    def _find(self, tokens, name, source):
+        lines = source.splitlines()
+        return [
+            (ln, col, length, typ, mods)
+            for ln, col, length, typ, mods in tokens
+            if ln < len(lines) and lines[ln][col:col+length] == name
+        ]
+
+    def test_classmethod_gets_static_modifier(self):
+        src = 'class Foo:\n    @classmethod\n    def bar(cls): pass\n'
+        bar = self._find(self._get_tokens(src), 'bar', src)
+        assert bar, 'token bar not found'
+        assert any('static' in m for *_, m in bar), f'static missing: {bar}'
+
+    def test_staticmethod_gets_static_modifier(self):
+        src = 'class Foo:\n    @staticmethod\n    def baz(x): pass\n'
+        baz = self._find(self._get_tokens(src), 'baz', src)
+        assert any('static' in m for *_, m in baz)
+
+    def test_regular_method_no_static(self):
+        src = 'class Foo:\n    def bar(self): pass\n'
+        bar = self._find(self._get_tokens(src), 'bar', src)
+        assert bar
+        assert not any('static' in m for *_, m in bar)
+
+    def test_augassign_modification_detected(self):
+        src = 'def f():\n    x = 0\n    x += 1\n'
+        x_tokens = self._find(self._get_tokens(src), 'x', src)
+        assert len(x_tokens) >= 2
+        assert any('modification' in m for *_, m in x_tokens)
+
+    def test_typevar_gets_readonly(self):
+        src = 'from typing import TypeVar\nT = TypeVar("T")\n'
+        t = self._find(self._get_tokens(src), 'T', src)
+        assert any('readonly' in m for *_, m in t)
+
+    def test_paramspec_gets_readonly(self):
+        src = 'from typing import ParamSpec\nP = ParamSpec("P")\n'
+        p = self._find(self._get_tokens(src), 'P', src)
+        assert any('readonly' in m for *_, m in p)
+
+    def test_typevartuple_gets_readonly(self):
+        src = 'from typing import TypeVarTuple\nTs = TypeVarTuple("Ts")\n'
+        ts = self._find(self._get_tokens(src), 'Ts', src)
+        assert ts, 'token Ts not found'
+        assert any('readonly' in m for *_, m in ts), f'readonly missing: {ts}'
+
+    def test_paramspec_args_is_typeparameter(self):
+        src = (
+            'from typing import ParamSpec\n'
+            'P = ParamSpec("P")\n'
+            'def wrapper(*args: P.args, **kwargs: P.kwargs): pass\n'
+        )
+        tp = [t for t in self._find(self._get_tokens(src), 'args', src)
+              if t[3] == 'typeParameter']
+        assert tp, 'no typeParameter for P.args'
+        assert any('readonly' in m for *_, m in tp)
+
+    def test_paramspec_kwargs_is_typeparameter(self):
+        src = (
+            'from typing import ParamSpec\n'
+            'P = ParamSpec("P")\n'
+            'def wrapper(*args: P.args, **kwargs: P.kwargs): pass\n'
+        )
+        tp = [t for t in self._find(self._get_tokens(src), 'kwargs', src)
+              if t[3] == 'typeParameter']
+        assert tp, 'no typeParameter for P.kwargs'
+        assert any('readonly' in m for *_, m in tp)
+
+    def test_enum_member_gets_readonly(self):
+        src = 'import enum\nclass Color(enum.Enum):\n    RED = 1\n'
+        red = self._find(self._get_tokens(src), 'RED', src)
+        assert red and any(t[3] == 'enumMember' for t in red)
+        assert any('readonly' in m for *_, m in red)
+
+    def test_classvar_gets_readonly(self):
+        src = 'from typing import ClassVar\nclass R:\n    _n: ClassVar[int] = 0\n'
+        n = self._find(self._get_tokens(src), '_n', src)
+        assert n, 'token _n not found'
+        assert any('readonly' in m for *_, m in n)
+
+    def test_deprecated_via_docstring(self):
+        src = 'def old(x):\n    """Deprecated: use new instead."""\n    return x\n'
+        fn = self._find(self._get_tokens(src), 'old', src)
+        assert fn, 'token old not found'
+        assert any('deprecated' in m for *_, m in fn)
