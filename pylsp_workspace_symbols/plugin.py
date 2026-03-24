@@ -29,9 +29,14 @@ Semantic tokens implementation notes:
   - Disabled by default; enable via pylsp.plugins.semantic_tokens.enabled.
 """
 from __future__ import annotations
+import io
 import logging
+import os
 import re
+import ast as _ast
 import threading
+import token as _token
+import tokenize as _tokenize
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
@@ -152,31 +157,35 @@ _DEFAULT_IGNORE_FOLDERS = {
 # TOKEN_MODIFIERS) so the client can interpret the indices correctly.
 # ---------------------------------------------------------------------------
 
-# Token type name -> index in the legend list sent to the client
+# Token type name -> index in the legend list sent to the client.
+# selfParameter and clsParameter extend the standard LSP legend so that
+# the semantictokens.py client can apply distinct colors to self/cls.
 _ST_TOKEN_TYPES: Dict[str, int] = {
-    "namespace":     0,
-    "type":          1,
-    "class":         2,
-    "enum":          3,
-    "interface":     4,
-    "struct":        5,
-    "typeParameter": 6,
-    "parameter":     7,
-    "variable":      8,
-    "property":      9,
-    "enumMember":    10,
-    "event":         11,
-    "function":      12,
-    "method":        13,
-    "macro":         14,
-    "keyword":       15,
-    "modifier":      16,
-    "comment":       17,
-    "string":        18,
-    "number":        19,
-    "regexp":        20,
-    "operator":      21,
-    "decorator":     22,
+    "namespace":      0,
+    "type":           1,
+    "class":          2,
+    "enum":           3,
+    "interface":      4,
+    "struct":         5,
+    "typeParameter":  6,
+    "parameter":      7,
+    "variable":       8,
+    "property":       9,
+    "enumMember":     10,
+    "event":          11,
+    "function":       12,
+    "method":         13,
+    "macro":          14,
+    "keyword":        15,
+    "modifier":       16,
+    "comment":        17,
+    "string":         18,
+    "number":         19,
+    "regexp":         20,
+    "operator":       21,
+    "decorator":      22,
+    "selfParameter":  23,  # Python self -- distinct from regular parameter
+    "clsParameter":   24,  # Python cls -- distinct from regular parameter
 }
 
 # Token modifier name -> bit index
@@ -191,6 +200,10 @@ _ST_TOKEN_MODIFIERS: Dict[str, int] = {
     "modification":   7,
     "documentation":  8,
     "defaultLibrary": 9,
+    # Extensions matching basedpyright's legend for accurate cross-server parity
+    "builtin":        10,  # builtins-module symbols (subset of defaultLibrary)
+    "classMember":    11,  # methods/properties declared inside a class body
+    "parameter":      12,  # applied to parameter/selfParameter/clsParameter tokens
 }
 
 # Jedi name type -> LSP semantic token type name
@@ -798,6 +811,169 @@ def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict
     return results
 
 
+def _build_ast_tables(source: str) -> dict:
+    # Single ast.parse() pass -- O(n), no extra Jedi calls.
+    # Builds three lookup tables used by _get_semantic_tokens to produce
+    # token types and modifiers that Jedi alone cannot determine:
+    #   type_overrides : (line0, name) -> LSP token type name
+    #   mod_overrides  : (line0, name) -> set of LSP modifier names
+    #   decorator_lines: line0 -> True
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return {"type_overrides": {}, "mod_overrides": {}, "decorator_lines": {}, "docstring_lines": set(), "overload_lines": set()}
+
+    type_overrides  = {}
+    mod_overrides   = {}
+    decorator_lines = {}
+    class_body_lines = set()   # line0 values inside any class body
+    enum_class_names = set()   # names of Enum subclasses
+    docstring_lines = set()    # lines with docstrings for documentation modifier
+    overload_lines = set()     # lines with @overload decorator
+
+    def _add_mod(line0, name_str, mod):
+        mod_overrides.setdefault((line0, name_str), set()).add(mod)
+
+    for node in _ast.walk(tree):
+
+        # TypeVar / ParamSpec / TypeVarTuple -> typeParameter + readonly
+        if isinstance(node, _ast.Assign):
+            val = node.value
+            if isinstance(val, _ast.Call):
+                fname = ""
+                if isinstance(val.func, _ast.Name):        fname = val.func.id
+                elif isinstance(val.func, _ast.Attribute): fname = val.func.attr
+                if fname in ("TypeVar", "ParamSpec", "TypeVarTuple"):
+                    for t in node.targets:
+                        if isinstance(t, _ast.Name):
+                            type_overrides[(t.lineno - 1, t.id)] = "typeParameter"
+                            _add_mod(t.lineno - 1, t.id, "readonly")
+
+        # Final / ClassVar annotated assignments -> readonly modifier
+        if isinstance(node, _ast.AnnAssign) and isinstance(node.target, _ast.Name):
+            ann = node.annotation
+            ann_id = ""
+            if isinstance(ann, _ast.Name):
+                ann_id = ann.id
+            elif isinstance(ann, _ast.Subscript) and isinstance(ann.value, _ast.Name):
+                ann_id = ann.value.id
+            if ann_id in ("Final", "ClassVar"):
+                _add_mod(node.target.lineno - 1, node.target.id, "readonly")
+
+        # Module-level plain assignments to UPPER_CASE names -> readonly
+        # Only plain _ast.Name targets (not attributes), at least 2 chars,
+        # all uppercase with at least one letter.
+        if isinstance(node, _ast.Assign):
+            for _t in node.targets:
+                if isinstance(_t, _ast.Name):
+                    _nm = _t.id
+                    if (len(_nm) >= 2
+                            and _nm == _nm.upper()
+                            and any(c.isalpha() for c in _nm)):
+                        _add_mod(_t.lineno - 1, _nm, "readonly")
+
+        # Enum members + class_body_lines + enum_class_names
+        if isinstance(node, _ast.ClassDef):
+            base_ids = set()
+            for b in node.bases:
+                if isinstance(b, _ast.Name):        base_ids.add(b.id)
+                elif isinstance(b, _ast.Attribute): base_ids.add(b.attr)
+            # Record every line inside the class body for method detection.
+            for item in node.body:
+                for child in _ast.walk(item):
+                    if hasattr(child, 'lineno'):
+                        class_body_lines.add(child.lineno - 1)
+            if base_ids & {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}:
+                enum_class_names.add(node.name)
+                for item in node.body:
+                    if isinstance(item, _ast.Assign):
+                        for t in item.targets:
+                            if isinstance(t, _ast.Name):
+                                type_overrides[(item.lineno - 1, t.id)] = "enumMember"
+                    elif isinstance(item, _ast.AnnAssign) and isinstance(item.target, _ast.Name):
+                        type_overrides[(item.lineno - 1, item.target.id)] = "enumMember"
+
+        # Function / method modifiers + decorator lines
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            ln0  = node.lineno - 1
+            nstr = node.name
+            # Track docstring lines for documentation modifier
+            if _ast.get_docstring(node):
+                docstring_lines.add(ln0)
+            if isinstance(node, _ast.AsyncFunctionDef):
+                _add_mod(ln0, nstr, "async")
+            # Register all parameter names so Jedi statement refs classify correctly.
+            _all_args = (
+                node.args.args + node.args.posonlyargs + node.args.kwonlyargs
+            )
+            if node.args.vararg:
+                _all_args = _all_args + [node.args.vararg]
+            if node.args.kwarg:
+                _all_args = _all_args + [node.args.kwarg]
+            for _arg in _all_args:
+                _aln = _arg.lineno - 1
+                _anm = _arg.arg
+                if _anm not in ("self", "cls"):
+                    type_overrides[(_aln, _anm)] = "parameter"
+            dec_names = set()
+            for d in node.decorator_list:
+                decorator_lines[d.lineno - 1] = True
+                dname = ""
+                if isinstance(d, _ast.Name):        dname = d.id
+                elif isinstance(d, _ast.Attribute): dname = d.attr
+                elif isinstance(d, _ast.Call):
+                    f = d.func
+                    if isinstance(f, _ast.Name):        dname = f.id
+                    elif isinstance(f, _ast.Attribute): dname = f.attr
+                dec_names.add(dname)
+            if "abstractmethod" in dec_names:
+                pass  # BP does not emit 'abstract' modifier; omit it
+            if "staticmethod" in dec_names or "classmethod" in dec_names:
+                _add_mod(ln0, nstr, "static")
+            if "deprecated" in dec_names:
+                _add_mod(ln0, nstr, "deprecated")
+            else:
+                doc = (_ast.get_docstring(node) or "").lower()
+                if "deprecated" in doc:
+                    _add_mod(ln0, nstr, "deprecated")
+
+        # Class decorator lines
+        if isinstance(node, _ast.ClassDef):
+            for d in node.decorator_list:
+                decorator_lines[d.lineno - 1] = True
+            # Track docstring lines for documentation modifier
+            if _ast.get_docstring(node):
+                docstring_lines.add(node.lineno - 1)
+            # Track @overload decorators
+            for d in node.decorator_list:
+                dname = ""
+                if isinstance(d, _ast.Name):
+                    dname = d.id
+                elif isinstance(d, _ast.Attribute):
+                    dname = d.attr
+                if dname == "overload":
+                    overload_lines.add(node.lineno - 1)
+
+    # Track augmented assignments (+=, -=, etc.) for modification modifier
+    # NOTE: must be outside the main walk loop to avoid shadowing the loop variable 'node'
+    augassign_vars: set = set()
+    for _aug_node in _ast.walk(tree):
+        if isinstance(_aug_node, _ast.AugAssign):
+            if isinstance(_aug_node.target, _ast.Name):
+                augassign_vars.add((_aug_node.lineno - 1, _aug_node.target.id))
+
+    return {
+        "type_overrides":   type_overrides,
+        "mod_overrides":    mod_overrides,
+        "decorator_lines":  decorator_lines,
+        "class_body_lines": class_body_lines,
+        "enum_class_names": enum_class_names,
+        "docstring_lines":  docstring_lines,
+        "overload_lines":   overload_lines,
+        "augassign_vars":   augassign_vars,
+    }
+
+
 def _get_semantic_tokens(
     source: str,
     path: str,
@@ -806,9 +982,11 @@ def _get_semantic_tokens(
 ) -> List[int]:
     """Return the LSP semantic tokens data array for *source*.
 
-    Uses jedi.Script.get_names(all_scopes=True) for a single O(n) Jedi call
-    instead of one ``goto`` per token, keeping response time low even on large
-    files.
+    Two-phase O(n) approach -- no per-token goto calls:
+      1. ast.parse() builds lookup tables for types/modifiers that Jedi
+         cannot determine alone (enumMember, typeParameter, decorator,
+         abstract/static/async/readonly/deprecated modifiers, self/cls).
+      2. jedi.Script.get_names() provides the base token stream.
 
     The returned flat integer list encodes tokens as 5-tuples of relative
     offsets as required by LSP 3.16:
@@ -817,6 +995,14 @@ def _get_semantic_tokens(
     if _jedi is None:
         return []
 
+    _norm_path = os.path.normpath(path) if path else ""
+    tables = _build_ast_tables(source)
+    type_overrides   = tables["type_overrides"]
+    mod_overrides    = tables["mod_overrides"]
+    decorator_lines  = tables["decorator_lines"]
+    class_body_lines = tables["class_body_lines"]
+    enum_class_names = tables["enum_class_names"]
+
     try:
         script = _jedi.Script(code=source, path=path)
         names = script.get_names(all_scopes=True, definitions=True, references=True)
@@ -824,8 +1010,410 @@ def _get_semantic_tokens(
         log.exception("pylsp_workspace_symbols: get_names failed for %s", path)
         return []
 
+    # Tokenize pass -- O(n), zero extra Jedi calls.
+    # at_positions : (line0, col) of each "@" token -> emits decorator
+    # annstr_names : (line0, col, name, length) of names inside type annotation
+    #                strings like "Callable[P, T]".
+    #                Only strings in AST annotation positions are processed.
+    at_positions: List[tuple] = []
+    annstr_names: List[tuple] = []
+    _src_lines = source.splitlines()
+    try:
+        for _tok in _tokenize.generate_tokens(io.StringIO(source).readline):
+            if _tok.type == _token.OP and _tok.string == "@":
+                at_positions.append((_tok.start[0] - 1, _tok.start[1]))
+    except _tokenize.TokenError:
+        pass
+    try:
+        _ann_tree = _ast.parse(source)
+
+        def _collect_ann_str(_ann_node: Any, _out: list) -> None:
+            """Collect names from forward-reference strings inside annotations,
+            including inside Subscript nodes like ClassVar[List["Registry"]]."""
+            if _ann_node is None:
+                return
+            if isinstance(_ann_node, _ast.Constant) and isinstance(_ann_node.value, str):
+                try:
+                    _expr2 = _ast.parse(_ann_node.value, mode="eval")
+                except SyntaxError:
+                    return
+                _sl0 = _ann_node.lineno - 1
+                _src2 = _src_lines[_sl0] if _sl0 < len(_src_lines) else ""
+                _sf2  = _ann_node.col_offset + 1
+                for _nn2 in _ast.walk(_expr2.body):
+                    if isinstance(_nn2, _ast.Name):
+                        # Find ALL occurrences of this name in the string, not just the first
+                        _search_start = _sf2
+                        while True:
+                            _idx2 = _src2.find(_nn2.id, _search_start)
+                            if _idx2 < 0:
+                                break
+                            _out.append((_sl0, _idx2, _nn2.id, len(_nn2.id)))
+                            _search_start = _idx2 + len(_nn2.id)  # Continue search after this occurrence
+            elif isinstance(_ann_node, _ast.Subscript):
+                _collect_ann_str(_ann_node.value, _out)
+                _collect_ann_str(_ann_node.slice, _out)
+            elif isinstance(_ann_node, (_ast.Tuple, _ast.List)):
+                for _elt2 in _ann_node.elts:
+                    _collect_ann_str(_elt2, _out)
+            elif isinstance(_ann_node, _ast.BinOp):
+                _collect_ann_str(_ann_node.left, _out)
+                _collect_ann_str(_ann_node.right, _out)
+
+        for _anode in _ast.walk(_ann_tree):
+            _anns: list = []
+            if isinstance(_anode, _ast.AnnAssign):
+                _anns = [_anode.annotation]
+            elif isinstance(_anode, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                _anns = [
+                    _a.annotation for _a in (
+                        _anode.args.args + _anode.args.posonlyargs +
+                        _anode.args.kwonlyargs +
+                        ([_anode.args.vararg] if _anode.args.vararg else []) +
+                        ([_anode.args.kwarg]  if _anode.args.kwarg  else [])
+                    ) if _a.annotation
+                ]
+                if _anode.returns:
+                    _anns.append(_anode.returns)
+            for _ann in _anns:
+                _collect_ann_str(_ann, annstr_names)
+    except SyntaxError:
+        pass
+
+    # Track variable assignments for modification modifier
+    _assigned_vars: Dict[str, List[tuple]] = {}  # name -> [(line0, col), ...]
+
     # Collect raw (line0, col, length, type_idx, mod_mask) tuples, sorted by
     # position so we can compute deltas in a single pass.
+    #
+    # Two-sub-pass strategy for statement references:
+    #   Pass A: classify all definitions and build fullname_to_type and
+    #           name_to_type lookup dicts using our full classification logic.
+    #   Pass B: classify all tokens; for unresolved statement references
+    #           consult the dicts built in pass A before falling back to
+    #           "variable". This resolves references like float/int/str
+    #           (builtin classes), self/cls (selfParameter/clsParameter),
+    #           and names whose definition appeared elsewhere in the file.
+    #   No per-token goto() calls -- O(n) total.
+
+    # Builtin and typing names that are always "class" regardless of context.
+    _BUILTIN_TYPES: frozenset = frozenset({
+        "float","int","str","bool","bytes","complex","list","dict","tuple",
+        "set","frozenset","type","object",
+        "Optional","List","Dict","Tuple","Set","FrozenSet","Type","Union",
+        "Callable","Iterator","Generator","Sequence","Any","ClassVar","Final",
+        "TypeVar","Generic","Protocol","TypedDict","NamedTuple","ParamSpec",
+        "TypeVarTuple","Concatenate","Literal","Annotated",
+        "dataclass","field","abstractmethod","ABC","ABCMeta",
+        # Enum base classes (accessed as enum.Enum, enum.IntEnum, etc.)
+        "Enum","IntEnum","StrEnum","Flag","IntFlag","EnumMeta",
+    })
+
+    # Builtin and stdlib names that are always "function" regardless of context.
+    # Covers Python builtins and well-known stdlib callables that Jedi emits as
+    # unresolved "statement" references (full_name lacks class/module prefix).
+    _BUILTIN_FUNCTIONS: frozenset = frozenset({
+        # Python builtin functions
+        "print","len","range","enumerate","zip","map","filter","sorted","reversed",
+        "sum","min","max","abs","round","pow","divmod","hash","id","hex","oct","bin",
+        "chr","ord","repr","isinstance","issubclass","hasattr","getattr","setattr",
+        "delattr","callable","iter","next","open","input","vars","dir","locals",
+        "globals","exec","eval","compile","__import__","super","format","breakpoint",
+        # list / deque methods
+        "append","extend","insert","remove","pop","clear","sort","reverse","copy",
+        # dict / set methods
+        "update","add","discard","get","items","keys","values","setdefault","fromkeys",
+        # str methods
+        "join","split","strip","lstrip","rstrip","replace","find","index","count",
+        "startswith","endswith","encode","decode","upper","lower","title","capitalize",
+        "format_map","zfill","center","ljust","rjust",
+        # re methods
+        "match","search","findall","finditer","sub","subn","fullmatch","groups",
+        "group","groupdict","span","start","end",
+        # os / pathlib / io
+        "getcwd","listdir","makedirs","mkdir","rmdir","remove","unlink","rename",
+        "stat","walk","scandir","chdir","getenv","putenv","environ",
+        "exists","isfile","isdir","basename","dirname","abspath","normpath","realpath",
+        "read","write","readline","readlines","writelines","seek","tell","flush","close",
+        # asyncio
+        "sleep","gather","create_task","run","wait","shield","ensure_future",
+        "get_event_loop","new_event_loop","set_event_loop",
+        # warnings / logging
+        "warn","simplefilter","filterwarnings","debug","info","warning","error",
+        "critical","exception","getLogger","basicConfig",
+        # itertools / functools
+        "chain","product","combinations","permutations","islice","groupby","partial",
+        "reduce","wraps","lru_cache","cache","cached_property",
+        # json / pickle
+        "dumps","loads","dump","load",
+        # datetime
+        "now","today","strftime","strptime","timedelta","fromisoformat",
+        # collections
+        "namedtuple","defaultdict","Counter","deque","OrderedDict",
+        # threading / subprocess
+        "Thread","start","join","run","communicate","check_output","call",
+    })
+
+    # Type priority: prefer more specific types when the same name has
+    # multiple definitions (e.g. a class named after a builtin).
+    _TYPE_PRIO = {
+        "class":10,"namespace":9,"function":8,"method":8,
+        "selfParameter":7,"clsParameter":7,"parameter":6,
+        "property":5,"enumMember":5,"typeParameter":5,
+        "decorator":4,"enum":4,"variable":1,
+    }
+
+    # Names used in raise/except/isinstance that Jedi emits as "statement"
+    # but basedpyright classifies as "class".
+    _EXCEPTION_CLASSES: frozenset = frozenset({
+        "Exception","BaseException","ValueError","TypeError","KeyError",
+        "IndexError","AttributeError","RuntimeError","StopIteration",
+        "NotImplementedError","OSError","IOError","FileNotFoundError",
+        "PermissionError","TimeoutError","ImportError","ModuleNotFoundError",
+        "NameError","ZeroDivisionError","OverflowError","MemoryError",
+        "RecursionError","SystemExit","KeyboardInterrupt","GeneratorExit",
+        "ArithmeticError","LookupError","EOFError","ConnectionError",
+        "UnicodeError","UnicodeDecodeError","UnicodeEncodeError",
+        "SyntaxError","AssertionError","DeprecationWarning",
+        "RuntimeWarning","UserWarning","Warning",
+    })
+
+    # self_attr_positions : (line0, col) of the attribute in self.X / cls.X -> property
+    # obj_attr_positions  : (line0, col) of the attribute in any obj.X -> method
+    self_attr_positions: set = set()
+    obj_attr_positions:  set = set()
+    try:
+        _tl = list(_tokenize.generate_tokens(io.StringIO(source).readline))
+        _i2 = 0
+        while _i2 < len(_tl) - 2:
+            _a, _b, _c = _tl[_i2], _tl[_i2 + 1], _tl[_i2 + 2]
+            if (_a.type == _token.NAME
+                    and _b.type == _token.OP and _b.string == "."
+                    and _c.type == _token.NAME):
+                _p = (_c.start[0] - 1, _c.start[1])
+                obj_attr_positions.add(_p)
+                if _a.string in ("self", "cls"):
+                    self_attr_positions.add(_p)
+                _i2 += 2
+            else:
+                _i2 += 1
+    except _tokenize.TokenError:
+        pass
+
+    # regexp_positions: (line0, col, length) of strings in re.compile() calls
+    # Stored as tuple with length so we can inject them as proper semantic tokens.
+    regexp_positions: set = set()
+    try:
+        _src_lines = source.splitlines()
+        for _node in _ast.walk(_ast.parse(source)):
+            if isinstance(_node, _ast.Call):
+                # Detect re.compile() calls
+                if isinstance(_node.func, _ast.Attribute):
+                    if _node.func.attr == "compile":
+                        if isinstance(_node.func.value, _ast.Name):
+                            if _node.func.value.id == "re":
+                                if _node.args:
+                                    first_arg = _node.args[0]
+                                    if isinstance(first_arg, _ast.Constant):
+                                        if isinstance(first_arg.value, str):
+                                            # Calculate the actual string start position (after prefix like 'r', 'b', 'u')
+                                            # AST col_offset points to the prefix, not the quote
+                                            _line_idx = first_arg.lineno - 1
+                                            _col_offset = first_arg.col_offset
+                                            # Find the opening quote in the source line
+                                            if _line_idx < len(_src_lines):
+                                                _line_content = _src_lines[_line_idx]
+                                                # Search for the quote character after the col_offset
+                                                for _i in range(_col_offset, min(_col_offset + 3, len(_line_content))):
+                                                    if _line_content[_i] in ('"', "'"):
+                                                        _col_offset = _i
+                                                        break
+                                            # Store (line0, col, length) for token injection
+                                            # Length includes the quotes
+                                            regexp_positions.add((
+                                                _line_idx,
+                                                _col_offset,
+                                                len(first_arg.value) + 2  # +2 for the quotes
+                                            ))
+    except SyntaxError:
+        pass
+
+    # type_alias_set: (line0, name) for X = A | B -> emits "type"
+    # Also covers X = Optional[Y], X = List[Y] etc. (common type aliases)
+    type_alias_set: set = set()
+    try:
+        for _ta in _ast.walk(_ast.parse(source)):
+            if isinstance(_ta, _ast.Assign):
+                _is_union = (isinstance(_ta.value, _ast.BinOp)
+                             and isinstance(_ta.value.op, _ast.BitOr))
+                _is_typing_alias = (
+                    isinstance(_ta.value, _ast.Subscript)
+                    and isinstance(_ta.value.value, _ast.Name)
+                    and _ta.value.value.id in (
+                        "Optional","Union","List","Dict","Tuple","Set",
+                        "FrozenSet","Callable","Iterator","Generator",
+                        "Sequence","Type","ClassVar","Final","Literal","Annotated",
+                    )
+                )
+                # Also detect string annotations that look like type aliases
+                _is_string_alias = (
+                    isinstance(_ta.value, _ast.Constant)
+                    and isinstance(_ta.value.value, str)
+                    and ("Callable" in _ta.value.value or "Callable" in _ta.value.value)
+                )
+                if _is_union or _is_typing_alias or _is_string_alias:
+                    for _t in _ta.targets:
+                        if isinstance(_t, _ast.Name):
+                            type_alias_set.add((_t.lineno - 1, _t.id))
+            # Python 3.12+ type statement: type Vector = list[float]
+            elif isinstance(_ta, _ast.AnnAssign):
+                # Detect pattern: variable with annotation at module level
+                if hasattr(_ta, 'target') and isinstance(_ta.target, _ast.Name):
+                    # Check if annotation suggests a type alias
+                    ann_id = ""
+                    if isinstance(_ta.annotation, _ast.Name):
+                        ann_id = _ta.annotation.id
+                    elif isinstance(_ta.annotation, _ast.Subscript):
+                        if isinstance(_ta.annotation.value, _ast.Name):
+                            ann_id = _ta.annotation.value.id
+                    if ann_id in ("type", "Type", "TypeAlias"):
+                        type_alias_set.add((_ta.target.lineno - 1, _ta.target.id))
+    except SyntaxError:
+        pass
+
+    # class_direct_lines: lines of AnnAssign/Assign directly inside a ClassDef body.
+    # Used in _classify to distinguish property (class member) from variable.
+    # Includes __slots__ which Jedi emits as a statement without ": ".
+    class_direct_lines: set = set()
+    class_slot_lines:   set = set()
+    static_property_names: set = set()  # names of class-level declared properties
+    try:
+        for _cd in _ast.walk(_ast.parse(source)):
+            if isinstance(_cd, _ast.ClassDef):
+                for _item in _cd.body:
+                    if isinstance(_item, _ast.AnnAssign) and isinstance(_item.target, _ast.Name):
+                        class_direct_lines.add(_item.lineno - 1)
+                        static_property_names.add(_item.target.id)
+                    elif isinstance(_item, _ast.Assign):
+                        class_direct_lines.add(_item.lineno - 1)
+                        for _t in _item.targets:
+                            if isinstance(_t, _ast.Name):
+                                static_property_names.add(_t.id)
+                                if _t.id == "__slots__":
+                                    class_slot_lines.add(_item.lineno - 1)
+                                    # also collect slot names from the tuple/list literal
+                                    if isinstance(_item.value, (
+                                            _ast.Tuple, _ast.List, _ast.Set)):
+                                        for _elt in _item.value.elts:
+                                            if isinstance(_elt, _ast.Constant) and isinstance(_elt.value, str):
+                                                static_property_names.add(_elt.value)
+    except SyntaxError:
+        pass
+
+    # stdlib_attr_positions: (line0, col) of attributes where the object is a stdlib module.
+    # These must NOT be promoted to "method" by obj_attr_positions.
+    _STDLIB_NAMES: frozenset = frozenset({
+        "os","sys","re","io","abc","ast","json","math","time","random","string",
+        "collections","itertools","functools","pathlib","typing","types","copy",
+        "warnings","logging","threading","asyncio","socket","struct","hashlib",
+        "datetime","calendar","enum","dataclasses","contextlib","inspect",
+        "weakref","operator","shutil","glob","tempfile","urllib","http",
+        "subprocess","multiprocessing","queue","heapq","bisect","array",
+        "pickle","shelve","sqlite3","csv","unittest","traceback","pprint",
+    })
+    stdlib_attr_positions: set = set()
+    try:
+        _tl3 = list(_tokenize.generate_tokens(io.StringIO(source).readline))
+        _i3  = 0
+        while _i3 < len(_tl3) - 2:
+            _a3, _b3, _c3 = _tl3[_i3], _tl3[_i3 + 1], _tl3[_i3 + 2]
+            if (_a3.type == _token.NAME
+                    and _b3.type == _token.OP and _b3.string == "."
+                    and _c3.type == _token.NAME
+                    and _a3.string in _STDLIB_NAMES):
+                stdlib_attr_positions.add((_c3.start[0] - 1, _c3.start[1]))
+            _i3 += 1
+    except _tokenize.TokenError:
+        pass
+
+    def _classify(n_: Any, is_ref: bool = False) -> Optional[str]:
+        # Return the LSP token type name for a Jedi Name object.
+        line0_ = n_.line - 1
+        nstr_  = n_.name
+        jtype_ = n_.type
+        full_  = n_.full_name or ""
+        pos_   = (line0_, nstr_)
+
+        if pos_ in type_overrides:
+            return type_overrides[pos_]
+        if jtype_ == "param":
+            if nstr_ == "self": return "selfParameter"
+            if nstr_ == "cls":  return "clsParameter"
+            return "parameter"
+        if jtype_ == "statement" and line0_ in decorator_lines and not n_.is_definition():
+            return "decorator"
+        if jtype_ == "statement" and ": " in (n_.description or "") and n_.is_definition():
+            # property only for direct ClassDef members.
+            # Variables inside functions or at module level -> variable.
+            return "property" if line0_ in class_direct_lines else "variable"
+        if jtype_ == "statement" and n_.is_definition() and line0_ in class_slot_lines:
+            # __slots__ = (...) inside a class body -> property
+            return "property"
+        if jtype_ == "function":
+            return "method" if line0_ in class_body_lines else "function"
+        if jtype_ == "class":
+            return "enum" if nstr_ in enum_class_names else "class"
+        if jtype_ in ("instance", "statement"):
+            return "variable"
+        if jtype_ == "module":   return "namespace"
+        if jtype_ == "keyword":  return "keyword"
+        if jtype_ == "property": return "property"
+        if jtype_ == "path":     return "namespace"
+        return None
+
+    # Pass A: build lookup dicts from definitions.
+    fullname_to_type: Dict[str, str] = {}
+    name_to_type: Dict[str, str] = {}
+    # Names registered as typeParameter (TypeVar/ParamSpec/TypeVarTuple)
+    # All references to these names get 'readonly' modifier, not just definitions.
+    typevar_names: set = {k[1] for k, v in type_overrides.items() if v == "typeParameter"}
+
+    # Build positions of X in typevar.X (e.g. P.args, P.kwargs) now that typevar_names is ready.
+    typevar_attr_positions: set = set()
+    try:
+        _tl_tv = list(_tokenize.generate_tokens(io.StringIO(source).readline))
+        _itv = 0
+        while _itv < len(_tl_tv) - 2:
+            _ta, _tb, _tc = _tl_tv[_itv], _tl_tv[_itv + 1], _tl_tv[_itv + 2]
+            if (_ta.type == _token.NAME and _ta.string in typevar_names
+                    and _tb.type == _token.OP and _tb.string == "."
+                    and _tc.type == _token.NAME):
+                typevar_attr_positions.add((_tc.start[0] - 1, _tc.start[1]))
+                _itv += 2
+            else:
+                _itv += 1
+    except _tokenize.TokenError:
+        pass
+
+    for n_ in names:
+        if not n_.is_definition() or n_.line is None:
+            continue
+        st_ = _classify(n_)
+        if st_ is None:
+            continue
+        full_ = n_.full_name or ""
+        if full_:
+            fullname_to_type[full_] = st_
+        nstr_ = n_.name
+        if _TYPE_PRIO.get(st_, 0) > _TYPE_PRIO.get(name_to_type.get(nstr_, ""), 0):
+            name_to_type[nstr_] = st_
+        # Track variable definitions for modification detection
+        if st_ == "variable":
+            line0_ = n_.line - 1
+            if nstr_ not in _assigned_vars:
+                _assigned_vars[nstr_] = []
+            _assigned_vars[nstr_].append((line0_, n_.column))
+
     raw: List[tuple] = []
     for name in names:
         if name.line is None or name.column is None:
@@ -835,39 +1423,269 @@ def _get_semantic_tokens(
         if line0 < start_line or line0 > end_line:
             continue
 
-        jedi_type = name.type
-        st_type_name = _JEDI_TYPE_TO_ST.get(jedi_type)
-        if st_type_name is None:
+        jtype = name.type
+        nstr  = name.name
+        full  = name.full_name or ""
+        pos   = (line0, nstr)
+
+        # Skip references to symbols defined in external files (stdlib,
+        # site-packages, other project files).  Comparing module_path to the
+        # current file is robust regardless of how Jedi sets the module name
+        # (it varies between __main__ and the real dotted name depending on
+        # whether path is supplied to jedi.Script).
+        try:
+            mp = str(name.module_path) if name.module_path else ""
+            is_external = bool(mp) and os.path.normpath(mp) != _norm_path
+        except Exception:
+            is_external = False
+        if not name.is_definition() and is_external:
             continue
-        type_idx = _ST_TOKEN_TYPES.get(st_type_name)
+
+        # --- token type ---
+        # AST-derived overrides take priority over Jedi type for cases Jedi
+        # cannot distinguish: TypeVar assignments, enum members, decorators.
+        if name.is_definition():
+            st_name = _classify(name)
+            if st_name is None:
+                continue
+            # self.X = ... as a definition site -> property (self_attr_positions)
+            if st_name == "variable" and (line0, name.column) in self_attr_positions:
+                st_name = "property"
+            # type alias: X = A | B or X = Optional[Y] -> "type"
+            if st_name in ("variable", "property") and (line0, nstr) in type_alias_set:
+                st_name = "type"
+        else:
+            # Pass B: resolve statement references via lookup dicts.
+            if jtype == "statement":
+                if pos in type_overrides:
+                    st_name = type_overrides[pos]
+                elif line0 in decorator_lines:
+                    if full in fullname_to_type:
+                        _ft = fullname_to_type[full]
+                        st_name = _ft if _ft not in ("variable", "statement") else "decorator"
+                    elif nstr in name_to_type:
+                        _nt = name_to_type[nstr]
+                        st_name = _nt if _nt not in ("variable", "statement") else "decorator"
+                    elif nstr in _BUILTIN_FUNCTIONS:
+                        st_name = "function"
+                    elif nstr in _BUILTIN_TYPES:
+                        st_name = "class"
+                    else:
+                        st_name = "decorator"
+                elif nstr == "self":
+                    st_name = "selfParameter"
+                elif nstr == "cls":
+                    st_name = "clsParameter"
+                elif (line0, name.column) in self_attr_positions:
+                    # self.X or cls.X -> property
+                    st_name = "property"
+                elif (line0, name.column) in stdlib_attr_positions:
+                    # stdlib module attribute: let fullname_to_type resolve it,
+                    # or fall back to "variable" (e.g. os.sep, sys.argv)
+                    if full in fullname_to_type:
+                        st_name = fullname_to_type[full]
+                    elif nstr in name_to_type:
+                        st_name = name_to_type[nstr]
+                    elif nstr in {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "EnumMeta"}:
+                        st_name = "enum"
+                    elif nstr in _BUILTIN_TYPES:
+                        st_name = "class"
+                    elif nstr in _BUILTIN_FUNCTIONS:
+                        st_name = "function"
+                    else:
+                        st_name = "variable"
+                elif (line0, name.column) in typevar_attr_positions:
+                    # typevar.X (e.g. P.args, P.kwargs) -> typeParameter
+                    st_name = "typeParameter"
+                elif (line0, name.column) in obj_attr_positions:
+                    # obj.X -> method if X is a function/method defined in this file
+                    if full in fullname_to_type:
+                        _ft = fullname_to_type[full]
+                        st_name = "method" if _ft in ("function", "method") else _ft
+                    elif nstr in name_to_type:
+                        _nt = name_to_type[nstr]
+                        st_name = "method" if _nt in ("function", "method") else _nt
+                    elif nstr in _BUILTIN_FUNCTIONS:
+                        st_name = "method"
+                    elif nstr in _BUILTIN_TYPES:
+                        st_name = "class"
+                    elif nstr in static_property_names:
+                        st_name = "property"
+                    else:
+                        st_name = "variable"
+                elif nstr in _EXCEPTION_CLASSES:
+                    st_name = "class"
+                elif full in fullname_to_type:
+                    _ft = fullname_to_type[full]
+                    if _ft == "variable" and nstr in name_to_type:
+                        st_name = name_to_type[nstr]
+                    else:
+                        st_name = _ft
+                elif nstr in _BUILTIN_TYPES:
+                    st_name = "class"
+                elif nstr in name_to_type:
+                    st_name = name_to_type[nstr]
+                elif nstr in _BUILTIN_FUNCTIONS:
+                    # Well-known builtin/stdlib callable -- Jedi emits it as an
+                    # unresolved statement ref because full_name lacks module prefix.
+                    # Checked after name_to_type so file-local definitions win.
+                    st_name = "function"
+                else:
+                    st_name = "variable"
+            else:
+                st_name = _classify(name)
+                if st_name is None:
+                    continue
+
+        type_idx = _ST_TOKEN_TYPES.get(st_name)
         if type_idx is None:
             continue
 
         # Build modifier bitmask
         mod_mask = 0
-        if name.is_definition():
-            mod_mask |= 1 << _ST_TOKEN_MODIFIERS["definition"]
+        _is_self_attr_prop = (
+            st_name == "property"
+            and (line0, name.column) in self_attr_positions
+        )
+        if name.is_definition() and not _is_self_attr_prop:
+            # BP only emits 'declaration' at definition sites, not 'definition'.
+            # Exceptions that BP does NOT mark with 'declaration':
+            #   - namespace (import statements: "import os", "from typing import X")
+            #   - typeParameter (TypeVar/ParamSpec: only get 'readonly')
+            #   - names imported via 'from X import Y' (just bindings)
+            #   - self.X property assignments (instance attribute bindings)
+            _is_import_binding = (
+                st_name in ("namespace", "class", "function", "variable",
+                            "type", "enumMember", "parameter", "typeParameter")
+                and bool(name.module_path)
+                and os.path.normpath(str(name.module_path)).lower() != _norm_path.lower()
+            )
+            # BP does not emit 'declaration' for class-scope property definitions
+            # (NamedTuple fields, TypedDict fields, __slots__, ClassVar, Final)
+            # or for enumMember definitions.
+            _is_class_prop_def = (
+                st_name in ("property", "enumMember") and line0 in class_direct_lines
+            )
+            if st_name not in ("typeParameter", "namespace") and not _is_import_binding and not _is_class_prop_def:
+                mod_mask |= 1 << _ST_TOKEN_MODIFIERS["declaration"]
+
+        # Apply AST-derived modifiers (static, async, readonly, deprecated).
+        # 'abstract' is intentionally excluded: BP does not emit it.
+        if pos in mod_overrides:
+            for mod in mod_overrides[pos]:
+                if mod == "abstract":
+                    continue  # BP legend has no abstract modifier
+                if mod in _ST_TOKEN_MODIFIERS:
+                    mod_mask |= 1 << _ST_TOKEN_MODIFIERS[mod]
+
+        # typeParameter references also get 'readonly' (not just the definition site)
+        if st_name == "typeParameter" and (
+            nstr in typevar_names
+            or (line0, name.column) in typevar_attr_positions
+        ):
+            mod_mask |= 1 << _ST_TOKEN_MODIFIERS["readonly"]
+
+        # classMember: methods and properties declared inside a class body
+        if st_name in ("method", "property") and line0 in class_body_lines:
+            mod_mask |= 1 << _ST_TOKEN_MODIFIERS["classMember"]
+
+        # static: class-level properties (ClassVar, NamedTuple fields, __slots__,
+        # Final class attributes, TypedDict fields) — BP emits 'static' for all
+        # class-scope properties including self.X refs to class-declared names.
+        if st_name == "property" and (
+            line0 in class_direct_lines
+            or nstr in static_property_names
+        ):
+            mod_mask |= 1 << _ST_TOKEN_MODIFIERS["static"]
+
+        # parameter modifier: applied to all parameter-typed tokens
+        if st_name in ("parameter", "selfParameter", "clsParameter"):
+            mod_mask |= 1 << _ST_TOKEN_MODIFIERS["parameter"]
+
+        # Modification modifier for reassigned variables
+        # Only apply to references (not definitions) of variables we've seen before
+        if not name.is_definition() and st_name == "variable":
+            if nstr in _assigned_vars:
+                # Check if this variable was defined on an earlier line
+                for def_line, def_col in _assigned_vars[nstr]:
+                    if def_line < line0:
+                        mod_mask |= 1 << _ST_TOKEN_MODIFIERS["modification"]
+                        break
+            # Also check for augmented assignments (+=, -=, etc.) via AST
+            elif nstr in tables.get("augassign_vars", set()):
+                mod_mask |= 1 << _ST_TOKEN_MODIFIERS["modification"]
+
+        # documentation modifier for symbols with docstrings
+        # Only apply to function/class/method definitions, not all tokens on the line
+        if line0 in tables.get("docstring_lines", set()):
+            if st_name in ("function", "method", "class"):
+                mod_mask |= 1 << _ST_TOKEN_MODIFIERS["documentation"]
+
+        # overload declaration modifier
+        if line0 in tables.get("overload_lines", set()):
             mod_mask |= 1 << _ST_TOKEN_MODIFIERS["declaration"]
 
-        # Detect async functions/methods via Jedi description
-        try:
-            desc = name.description or ""
-            if jedi_type == "function" and desc.startswith("def ") is False:
-                # description for async functions starts with "async def"
-                if "async" in desc.split()[:2]:
-                    mod_mask |= 1 << _ST_TOKEN_MODIFIERS["async"]
-        except Exception:
-            pass
-
-        # Detect defaultLibrary: builtins or stdlib top-level module
+        # Detect defaultLibrary + builtin.
+        # Only apply to names whose module_name resolves to a stdlib module.
+        # Skip tokens resolved via obj_attr_positions (method calls on user objects).
+        _is_obj_attr = (line0, name.column) in obj_attr_positions
         try:
             mod_name = (name.module_name or "").split(".")[0]
-            if mod_name in _STDLIB_TOP:
-                mod_mask |= 1 << _ST_TOKEN_MODIFIERS["defaultLibrary"]
+            if mod_name in _STDLIB_TOP and not _is_obj_attr:
+                _def_path = str(name.module_path) if name.module_path else ""
+                _is_local = bool(_def_path) and os.path.normpath(_def_path).lower() == _norm_path.lower()
+                if not _is_local:
+                    mod_mask |= 1 << _ST_TOKEN_MODIFIERS["defaultLibrary"]
+                    if mod_name == "builtins":
+                        mod_mask |= 1 << _ST_TOKEN_MODIFIERS["builtin"]
+            elif not _is_obj_attr and not name.is_definition():
+                # Fallback for builtins Jedi doesn't resolve to a module
+                # (e.g. 'float', 'str', 'len' used as annotations or calls)
+                if nstr in _BUILTIN_TYPES or nstr in _BUILTIN_FUNCTIONS:
+                    mod_mask |= 1 << _ST_TOKEN_MODIFIERS["defaultLibrary"]
+                    mod_mask |= 1 << _ST_TOKEN_MODIFIERS["builtin"]
         except Exception:
             pass
 
-        raw.append((line0, name.column, len(name.name), type_idx, mod_mask))
+        raw.append((line0, name.column, len(nstr), type_idx, mod_mask))
+
+    # Inject "@" (decorator) tokens -- BP emits a "decorator" token for the
+    # "@" symbol itself; Jedi never does.
+    _dec_idx = _ST_TOKEN_TYPES.get("decorator")
+    _cls_idx = _ST_TOKEN_TYPES.get("class")
+    _tp_idx  = _ST_TOKEN_TYPES.get("typeParameter")
+    _raw_pos = {(r[0], r[1]) for r in raw}
+    if _dec_idx is not None:
+        for _ln0, _col in at_positions:
+            if start_line <= _ln0 <= end_line and (_ln0, _col) not in _raw_pos:
+                raw.append((_ln0, _col, 1, _dec_idx, 0))
+                _raw_pos.add((_ln0, _col))
+
+    # Inject names from annotation strings ("Callable[P, T]").
+    # Jedi does not parse string literals; BP resolves them via type inference.
+    # typeParameter names (TypeVar/ParamSpec/TypeVarTuple) get readonly, consistent
+    # with how the main token loop handles typeParameter references.
+    if _tp_idx is not None and _cls_idx is not None:
+        _ro_mask = 1 << _ST_TOKEN_MODIFIERS["readonly"]
+        for _ln0, _col, _nm, _length in annstr_names:
+            if start_line <= _ln0 <= end_line and (_ln0, _col) not in _raw_pos:
+                # typeParameter if the name was declared as TypeVar/ParamSpec/TypeVarTuple.
+                _is_tp = name_to_type.get(_nm) == "typeParameter"
+                _st_idx = _tp_idx if _is_tp else _cls_idx
+                # typeParameter references inside annotation strings also get readonly
+                _mod = _ro_mask if _is_tp else 0
+                raw.append((_ln0, _col, _length, _st_idx, _mod))
+                _raw_pos.add((_ln0, _col))
+
+    # Inject regexp tokens for re.compile() string patterns.
+    # Jedi does not emit string literals as semantic tokens, so we inject them
+    # manually like we do for '@' decorator tokens and annotation type names.
+    _regexp_idx = _ST_TOKEN_TYPES.get("regexp")
+    if _regexp_idx is not None:
+        for _ln0, _col, _length in regexp_positions:
+            if start_line <= _ln0 <= end_line and (_ln0, _col) not in _raw_pos:
+                raw.append((_ln0, _col, _length, _regexp_idx, 0))
+                _raw_pos.add((_ln0, _col))
 
     # Sort by (line, col) - Jedi may return names out of order
     raw.sort(key=lambda t: (t[0], t[1]))
