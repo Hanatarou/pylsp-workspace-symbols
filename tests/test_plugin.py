@@ -719,3 +719,58 @@ class TestSemanticTokens:
         fn = self._find(self._get_tokens(src), 'old', src)
         assert fn, 'token old not found'
         assert any('deprecated' in m for *_, m in fn)
+
+    def test_deprecated_via_decorator(self):
+        src = (
+            'from typing_extensions import deprecated\n'
+            'class Foo:\n'
+            '    @deprecated("old")\n'
+            '    def legacy(self): pass\n'
+        )
+        fn = self._find(self._get_tokens(src), 'legacy', src)
+        assert fn, 'token legacy not found'
+        assert any('deprecated' in m for *_, m in fn)
+
+    def test_async_function_gets_async_modifier(self):
+        src = 'async def fetch(): pass\n'
+        fn = self._find(self._get_tokens(src), 'fetch', src)
+        assert fn, 'token fetch not found'
+        assert any('async' in m for *_, m in fn)
+
+    def test_documented_function_gets_documentation_modifier(self):
+        src = 'def well_doc():\n    """A documented function."""\n    pass\n'
+        fn = self._find(self._get_tokens(src), 'well_doc', src)
+        assert fn, 'token well_doc not found'
+        assert any('documentation' in m for *_, m in fn)
+
+    def test_upper_case_name_gets_readonly(self):
+        src = 'APP_NAME = "app"\n'
+        t = self._find(self._get_tokens(src), 'APP_NAME', src)
+        assert t, 'token APP_NAME not found'
+        assert any('readonly' in m for *_, m in t)
+
+    def test_typevar_in_annotation_string_gets_readonly(self):
+        src = (
+            'from typing import TypeVar\n'
+            'T = TypeVar("T")\n'
+            'def f(x: "Callable[T, int]"): pass\n'
+        )
+        t_tokens = self._find(self._get_tokens(src), 'T', src)
+        assert any(t[3] == 'typeParameter' and 'readonly' in t[4] for t in t_tokens)
+
+    def test_regexp_token_in_re_compile(self):
+        src = 'import re\npattern = re.compile(r"[a-z]+")\n'
+        ts = self._get_tokens(src)
+        assert any(t[3] == 'regexp' for t in ts), 'no regexp token found'
+
+    def test_type_alias_union(self):
+        src = 'MyType = int | str\n'
+        t = self._find(self._get_tokens(src), 'MyType', src)
+        assert t, 'token MyType not found'
+        assert any(tok[3] == 'type' for tok in t)
+
+    def test_type_alias_optional(self):
+        src = 'from typing import Optional\nMaybeStr = Optional[str]\n'
+        t = self._find(self._get_tokens(src), 'MaybeStr', src)
+        assert t, 'token MaybeStr not found'
+        assert any(tok[3] == 'type' for tok in t)
