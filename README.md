@@ -192,8 +192,12 @@ definitions:
 ### Semantic tokens
 
 Your LSP client will receive `semanticTokensProvider` when `semantic_tokens.enabled` is `true`.
-Token types follow the standard LSP legend (`namespace`, `class`, `function`, `variable`,
-`parameter`, etc.) with modifiers for `definition`, `async`, and `defaultLibrary` names.
+Token types follow an extended LSP legend: `namespace`, `type`, `class`, `enum`, `interface`,
+`struct`, `typeParameter`, `parameter`, `variable`, `property`, `enumMember`, `function`,
+`method`, `macro`, `keyword`, `comment`, `string`, `number`, `regexp`, `operator`,
+`decorator`, plus Python-specific `selfParameter` and `clsParameter`.
+Modifiers include `declaration`, `readonly`, `static`, `deprecated`, `async`,
+`modification`, `documentation`, `defaultLibrary`, `builtin`, `classMember`, and `parameter`.
 Disabled by default — enable explicitly if your client supports it and you want Jedi-backed
 token classification in addition to your editor's built-in lexer.
 
@@ -272,9 +276,23 @@ ensures the I/O is shared between the references filter and the implementations 
 
 ### Semantic tokens
 
-Handled via `textDocument/semanticTokens/full`, `full/delta`, and `range` dispatchers. Uses
-`jedi.Script.get_names(all_scopes=True)` for a single O(n) pass — no per-token `goto` calls.
-Delta computation uses `SequenceMatcher` to produce minimal `SemanticTokensEdit[]` arrays.
+Handled via `textDocument/semanticTokens/full`, `full/delta`, and `range` dispatchers.
+Uses a two-phase O(n) approach — no per-token `goto` calls:
+
+1. **AST pass** — single `ast.parse()` walk to build lookup tables for token types and
+   modifiers that Jedi alone cannot determine: `enumMember`, `typeParameter`, `decorator`,
+   `@classmethod`/`@staticmethod` → `static`, `ClassVar`/`Final` → `readonly`,
+   `deprecated` (via decorator or docstring), `async`, and augmented assignments → `modification`.
+2. **Jedi pass** — `jedi.Script.get_names(all_scopes=True)` provides the base token stream.
+   A two-sub-pass strategy resolves statement references via lookup dicts built in phase 1,
+   avoiding any per-token inference calls.
+
+Beyond the two main passes, a token injection stage handles symbols that neither Jedi nor
+the AST walk emit directly: `@` decorator markers, names inside forward-reference annotation
+strings, type parameter attributes (e.g. `ParamSpec.args`), and regexp patterns in
+`re.compile()` calls. Each injected token receives the correct type and modifiers using the
+same lookup tables built in the AST pass. Delta computation uses `SequenceMatcher` to
+produce minimal `SemanticTokensEdit[]` arrays.
 
 ### Call hierarchy
 
