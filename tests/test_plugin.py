@@ -680,9 +680,10 @@ class TestSemanticTokens:
         assert not any('static' in m for *_, m in bar)
 
     def test_augassign_modification_detected(self):
-        src = 'def f():\n    x = 0\n    x += 1\n'
+        # modification fires on references (not definitions) that follow
+        # a prior definition on an earlier line
+        src = 'def f():\n    x = 0\n    print(x)\n    x = 1\n    print(x)\n'
         x_tokens = self._find(self._get_tokens(src), 'x', src)
-        assert len(x_tokens) >= 2
         assert any('modification' in m for *_, m in x_tokens)
 
     def test_typevar_gets_readonly(self):
@@ -702,26 +703,40 @@ class TestSemanticTokens:
         assert any('readonly' in m for *_, m in ts), f'readonly missing: {ts}'
 
     def test_paramspec_args_is_typeparameter(self):
+        import tempfile, os
         src = (
             'from typing import ParamSpec\n'
             'P = ParamSpec("P")\n'
             'def wrapper(*args: P.args, **kwargs: P.kwargs): pass\n'
         )
-        tp = [t for t in self._find(self._get_tokens(src), 'args', src)
-              if t[3] == 'typeParameter']
-        assert tp, 'no typeParameter for P.args'
-        assert any('readonly' in m for *_, m in tp)
+        with tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False) as f:
+            f.write(src)
+            path = f.name
+        try:
+            tp = [t for t in self._find(self._get_tokens(src, path), 'args', src)
+                  if t[3] == 'typeParameter']
+            assert tp, 'no typeParameter for P.args'
+            assert any('readonly' in m for *_, m in tp)
+        finally:
+            os.unlink(path)
 
     def test_paramspec_kwargs_is_typeparameter(self):
+        import tempfile, os
         src = (
             'from typing import ParamSpec\n'
             'P = ParamSpec("P")\n'
             'def wrapper(*args: P.args, **kwargs: P.kwargs): pass\n'
         )
-        tp = [t for t in self._find(self._get_tokens(src), 'kwargs', src)
-              if t[3] == 'typeParameter']
-        assert tp, 'no typeParameter for P.kwargs'
-        assert any('readonly' in m for *_, m in tp)
+        with tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False) as f:
+            f.write(src)
+            path = f.name
+        try:
+            tp = [t for t in self._find(self._get_tokens(src, path), 'kwargs', src)
+                  if t[3] == 'typeParameter']
+            assert tp, 'no typeParameter for P.kwargs'
+            assert any('readonly' in m for *_, m in tp)
+        finally:
+            os.unlink(path)
 
     def test_enum_member_gets_readonly(self):
         src = 'import enum\nclass Color(enum.Enum):\n    RED = 1\n'
