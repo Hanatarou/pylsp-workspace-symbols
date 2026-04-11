@@ -728,3 +728,65 @@ class TestSemanticTokens:
         fn = self._find(self._get_tokens(src), 'old', src)
         assert fn, 'token old not found'
         assert any('deprecated' in m for *_, m in fn)
+
+
+# ---------------------------------------------------------------------------
+# _search_symbols - multi-root workspace
+# ---------------------------------------------------------------------------
+
+class TestSearchSymbolsMultiRoot:
+    def _run_multi(self, names_per_root, query="", max_symbols=500):
+        """Simulate multiple workspace roots via server.workspaces."""
+        from pylsp_workspace_symbols.plugin import _search_symbols
+
+        fake_workspaces = {}
+        for i, (root, names) in enumerate(names_per_root.items()):
+            ws = MagicMock()
+            ws.root_path = root
+            fake_workspaces[str(i)] = ws
+
+        workspace = MagicMock()
+        workspace.root_path = next(iter(names_per_root))
+        workspace._endpoint._dispatcher.workspaces = fake_workspaces
+
+        settings = _make_settings(max_symbols=max_symbols)
+
+        call_count = [0]
+        original_names = list(names_per_root.values())
+
+        def fake_project(path, sys_path):
+            idx = call_count[0]
+            call_count[0] += 1
+            proj = MagicMock()
+            proj.complete_search.return_value = iter(original_names[idx])
+            return proj
+
+        with patch("pylsp_workspace_symbols.plugin._jedi") as mock_jedi:
+            mock_jedi.Project.side_effect = fake_project
+            return _search_symbols(settings, workspace, query)
+
+    def test_symbols_from_both_roots_returned(self):
+        names_a = [_make_jedi_name("func_a", "function",
+                                   module_path="/proj_a/mod.py")]
+        names_b = [_make_jedi_name("func_b", "function",
+                                   module_path="/proj_b/mod.py")]
+        results = self._run_multi({"/proj_a": names_a, "/proj_b": names_b})
+        result_names = {r["name"] for r in results}
+        assert "func_a" in result_names
+        assert "func_b" in result_names
+
+    def test_single_root_still_works(self):
+        names = [_make_jedi_name("only_func", "function",
+                                 module_path="/proj/mod.py")]
+        results = self._run_multi({"/proj": names})
+        assert len(results) == 1
+        assert results[0]["name"] == "only_func"
+
+    def test_max_symbols_respected_across_roots(self):
+        names_a = [_make_jedi_name(f"a_{i}", "function",
+                                   module_path=f"/proj_a/m{i}.py") for i in range(5)]
+        names_b = [_make_jedi_name(f"b_{i}", "function",
+                                   module_path=f"/proj_b/m{i}.py") for i in range(5)]
+        results = self._run_multi({"/proj_a": names_a, "/proj_b": names_b},
+                                  max_symbols=6)
+        assert len(results) == 6
