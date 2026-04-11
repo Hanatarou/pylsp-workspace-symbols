@@ -29,10 +29,12 @@ Semantic tokens implementation notes:
   - Disabled by default; enable via pylsp.plugins.semantic_tokens.enabled.
 """
 from __future__ import annotations
+
 import io
 import logging
 import os
 import re
+import time
 import ast as _ast
 import threading
 import token as _token
@@ -41,6 +43,7 @@ from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 from pylsp import hookimpl, uris
 
 # NOTE: Jedi is already imported for workspace symbols, reuse it for inlay hints
@@ -379,13 +382,18 @@ def pylsp_experimental_capabilities(config, workspace) -> dict:
 
 @hookimpl
 def pylsp_dispatchers(config, workspace) -> dict:
-    """Register handlers for both methods."""
+    """Register custom JSON-RPC dispatch handlers for this plugin.
+
+    Covers workspace/symbol, textDocument/inlayHint, call hierarchy,
+    type hierarchy, document links, document colors, color presentation,
+    and semantic tokens (full, delta, range).
+    """
     settings_ws = config.plugin_settings("jedi_workspace_symbols")
     settings_ih = config.plugin_settings("inlay_hints")
 
     dispatch: Dict[str, Any] = {}
 
-    # Workspace symbols (your original handler)
+    # Workspace symbols
     if settings_ws.get("enabled", True):
         def _workspace_symbol(params) -> Optional[List[dict]]:
             # pylsp_jsonrpc calls handlers with the raw params dict as a single
@@ -576,7 +584,6 @@ def pylsp_dispatchers(config, workspace) -> dict:
 
         dispatch["textDocument/colorPresentation"] = _color_presentation
 
-
     # -- Semantic tokens -------------------------------------------------------
     settings_st = config.plugin_settings("semantic_tokens")
     if settings_st.get("enabled", False) and HAS_INLAY_DEPS:
@@ -682,6 +689,15 @@ def _in_ignored_folder(path: str, ignore_folders: set) -> bool:
     )
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    """Python 3.8-compatible replacement for Path.is_relative_to (added in 3.9)."""
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict]]:
     """Core Jedi-backed implementation of workspace/symbol.
 
@@ -691,13 +707,18 @@ def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict
     performs exact name matching and misses partial matches (e.g. 'area'
     won't find 'calculate_area').
 
-    Results are strictly limited to files inside workspace.root_path.
+    Results are restricted to files inside any known workspace folder.
+    The set of workspace folders is read directly from the PythonLSPServer
+    instance via ``workspace._endpoint._dispatcher.workspaces`` - the same
+    dict that pylsp updates when it receives workspace/didChangeWorkspaceFolders.
+    This is necessary because pylsp_dispatchers is called once at startup and
+    the workspace captured in the closure never reflects later folder additions.
 
-    Performance: ``sys_path=[workspace_root]`` restricts Jedi's indexing to
-    the workspace directory only, reducing the symbol set from the full Python
+    Performance: ``sys_path=[root]`` restricts Jedi's indexing to each
+    workspace folder only, reducing the symbol set from the full Python
     environment (stdlib + site-packages) to just project files.  In practice
     this yields a ~80x speedup on ``complete_search`` (7000ms -> 88ms on a
-    typical environment) with no loss of correctness - the ``relative_to``
+    typical environment) with no loss of correctness - the ``_is_relative_to``
     guard below discards the small number of typeshed ``.pyi`` stubs that
     still leak through.  ``get_references()`` is unaffected because each
     call hierarchy / type hierarchy request creates its own ``jedi.Script``
@@ -714,32 +735,46 @@ def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict
     )
     query_lower = query.lower()
 
-    # Resolve once outside the loop - Path handles separators on all OS.
-    workspace_root = Path(workspace.root_path)
+    # Read all workspace roots from the live server dict.
+    # Falls back to workspace.root_path if the internal API is unavailable.
+    workspace_roots: List[Path] = []
+    try:
+        server = workspace._endpoint._dispatcher
+        for ws in server.workspaces.values():
+            p = Path(ws.root_path)
+            if p not in workspace_roots:
+                workspace_roots.append(p)
+    except Exception:
+        pass
+    if not workspace_roots:
+        workspace_roots = [Path(workspace.root_path)]
 
     try:
-        # sys_path=[workspace_root] tells Jedi to index only the workspace,
+        # sys_path=[root] tells Jedi to index only that workspace folder,
         # not the entire Python environment.  This is the correct fix for the
         # "returns thousands of results from stdlib/site-packages" problem -
         # filtering after the fact still requires Jedi to enumerate everything
         # first, which is slow.  get_references() in call/type hierarchy is
         # unaffected: those requests create their own jedi.Script instances
         # with separate project objects that include the full sys_path.
-        project = _jedi.Project(
-            path=workspace.root_path,
-            sys_path=[workspace.root_path],
-        )
-        # Always use complete_search("") to get all names, then filter
-        # client-side. project.search(query) in older bundled Jedi performs
-        # exact name matching, so 'area' would never find 'calculate_area'.
-        # Note: project.search("") returns nothing - hence complete_search.
-        import time as _time
-        _t0 = _time.time()
-        names = list(project.complete_search(""))
-        log.info(
-            "pylsp_workspace_symbols: complete_search yielded %d names in %.0fms",
-            len(names), (_time.time() - _t0) * 1000,
-        )
+        names: List[Any] = []
+        for root in workspace_roots:
+            _t0 = time.time()
+            project = _jedi.Project(
+                path=str(root),
+                sys_path=[str(root)],
+            )
+            # Always use complete_search("") to get all names, then filter
+            # client-side. project.search(query) in older bundled Jedi performs
+            # exact name matching, so 'area' would never find 'calculate_area'.
+            # Note: project.search("") returns nothing - hence complete_search.
+            root_names = list(project.complete_search(""))
+            log.info(
+                "pylsp_workspace_symbols: complete_search yielded %d names in %.0fms"
+                " (root=%s)",
+                len(root_names), (time.time() - _t0) * 1000, root,
+            )
+            names.extend(root_names)
     except Exception:
         log.exception("pylsp_workspace_symbols: Jedi search failed")
         return None
@@ -762,13 +797,11 @@ def _search_symbols(settings: dict, workspace, query: str) -> Optional[List[dict
             if module_path is None:
                 continue
 
-            # Restrict to files inside the workspace root.
+            # Restrict to files inside any known workspace root.
             # complete_search() returns symbols from the entire Python
             # environment; without this guard, stdlib/.pyi/site-packages
             # symbols leak into results.
-            try:
-                module_path.relative_to(workspace_root)
-            except ValueError:
+            if not any(_is_relative_to(module_path, root) for root in workspace_roots):
                 continue
 
             if _in_ignored_folder(str(module_path), ignore_folders):
@@ -1259,7 +1292,11 @@ def _get_semantic_tokens(
                 _is_string_alias = (
                     isinstance(_ta.value, _ast.Constant)
                     and isinstance(_ta.value.value, str)
-                    and ("Callable" in _ta.value.value or "Callable" in _ta.value.value)
+                    and any(n in _ta.value.value for n in (
+                        "Optional", "Union", "List", "Dict", "Tuple", "Set",
+                        "FrozenSet", "Callable", "Iterator", "Generator",
+                        "Sequence", "Type", "ClassVar", "Final", "Literal", "Annotated",
+                    ))
                 )
                 if _is_union or _is_typing_alias or _is_string_alias:
                     for _t in _ta.targets:
@@ -1590,7 +1627,7 @@ def _get_semantic_tokens(
             mod_mask |= 1 << _ST_TOKEN_MODIFIERS["classMember"]
 
         # static: class-level properties (ClassVar, NamedTuple fields, __slots__,
-        # Final class attributes, TypedDict fields) — BP emits 'static' for all
+        # Final class attributes, TypedDict fields) - BP emits 'static' for all
         # class-scope properties including self.X refs to class-declared names.
         if st_name == "property" and (
             line0 in class_direct_lines
@@ -2481,8 +2518,6 @@ def _call_hierarchy_prepare(
 
 def _call_hierarchy_outgoing(item: dict, workspace) -> List[dict]:
     """callHierarchy/outgoingCalls - all callees inside the item's function body."""
-    import ast as _ast
-
     data = item.get("data", {})
     path = data.get("path", "")
     item_line = data.get("line", 1)   # 1-based
@@ -2681,8 +2716,6 @@ def _type_hierarchy_prepare(
 
 def _type_hierarchy_supertypes(item: dict) -> List[dict]:
     """typeHierarchy/supertypes - direct parent classes of the given class."""
-    import ast as _ast
-
     data = item.get("data", {})
     path = data.get("path", "")
     item_line = data.get("line", 1)
@@ -2735,8 +2768,6 @@ def _type_hierarchy_supertypes(item: dict) -> List[dict]:
 
 def _type_hierarchy_subtypes(item: dict, workspace) -> List[dict]:
     """typeHierarchy/subtypes - classes that inherit from the given class."""
-    import ast as _ast
-
     data = item.get("data", {})
     path = data.get("path", "")
     item_line = data.get("line", 1)
@@ -2855,10 +2886,6 @@ def _collect_document_links(source: str, path: str, workspace) -> List[dict]:
       3. String literals that look like file-system paths.
       4. ``open()`` / ``Path()`` / ``pathlib.Path()`` call arguments.
     """
-    import ast as _ast
-    import os
-    import re
-
     results: List[dict] = []
     seen: set = set()
     base_dir = os.path.dirname(path) if path else ""
@@ -3566,8 +3593,6 @@ def _find_cross_file_subclasses(
 
     Returns an empty list on any error so callers degrade gracefully.
     """
-    import ast as _ast
-
     if _jedi is None or not path:
         return []
     try:
@@ -3667,8 +3692,6 @@ def _get_code_lenses(
       - ``🧪 Run test``         - ``def test_*`` functions and ``Test*`` classes,
                                    command: ``pylsp_workspace_symbols.run_test``
     """
-    import ast as _ast
-
     source_hash = str(hash(source))
     cached = _cl_cache_get(uri, source_hash)
     if cached is not None:
@@ -3794,7 +3817,6 @@ def _get_code_lenses(
             jedi_script = _jedi.Script(code=disk_source, path=path, project=project)
         except Exception as exc:
             log.exception("pylsp_workspace_symbols: codeLens jedi.Script failed: %s", exc)
-
 
     # -- pre-compute inheritance usage positions ------------------------------
     # Maps (line_1based, col) -> base_name for every base-class usage in this
