@@ -236,11 +236,13 @@ hex (`#rgb`, `#rrggbb`, `#rrggbbaa`), `rgb()`/`rgba()`, `hsl()`/`hsla()`, and CS
 2. **Experimental fallback** — if the injection fails (e.g. pylsp changes its internal API), capabilities are announced via `pylsp_experimental_capabilities` instead. Clients that honour the experimental channel (CudaText, VSCode with pylsp, etc.) will still work.
 3. **`pylsp_dispatchers`** — registers a custom JSON-RPC handler for `workspace/symbol` that calls Jedi's `project.complete_search()` and filters results client-side by case-insensitive substring match.
 
-Results are **strictly limited to files inside the workspace root**. The project is initialized
-with `sys_path=[workspace_root]`, which restricts Jedi's indexing to the workspace directory only
-— avoiding the full Python environment (stdlib + site-packages). This yields an ~80x speedup on
-`complete_search` compared to the default Jedi project. A `relative_to()` guard provides a
-second layer of filtering for the small number of typeshed stubs that still appear.
+Results are **limited to files inside the known workspace folders**. All open workspace roots are
+read from the live server at query time via `server.workspaces`, so folders added after startup
+(`workspace/didChangeWorkspaceFolders`) are included correctly. Each root is searched with
+`sys_path=[root]`, restricting Jedi's indexing to that folder only — avoiding the full Python
+environment (stdlib + site-packages). This yields an ~80x speedup on `complete_search` compared
+to the default Jedi project. A `_is_relative_to()` guard (Python 3.8-compatible replacement for
+`Path.is_relative_to`, which requires 3.9+) provides a second layer of filtering.
 
 > **Note:** `workspace/symbol` returns module-level definitions (functions, classes, modules).
 > Local variables inside functions are not indexed — this is standard LSP behaviour,
