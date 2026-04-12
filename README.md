@@ -298,7 +298,7 @@ produce minimal `SemanticTokensEdit[]` arrays.
 
 ### Call hierarchy
 
-Handled via `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls` dispatchers. Uses Jedi's `script.goto()` and `script.get_references()` to resolve callers and callees, building LSP-compliant `CallHierarchyItem` structures with correct range information.
+Handled via `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls` dispatchers. Uses Jedi's `script.goto()` and `script.get_references()` to resolve callers and callees, building LSP-compliant `CallHierarchyItem` structures with correct range information. Functions decorated with `@overload` are handled correctly — Jedi returns all overload stubs as references to the real implementation (shared qualified name); incoming calls filters them out via `ref.is_definition()`, which is `True` for all definition sites and `False` for actual call sites.
 
 ### Type hierarchy
 
