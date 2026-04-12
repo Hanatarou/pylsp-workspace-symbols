@@ -790,3 +790,48 @@ class TestSearchSymbolsMultiRoot:
         results = self._run_multi({"/proj_a": names_a, "/proj_b": names_b},
                                   max_symbols=6)
         assert len(results) == 6
+
+
+# ---------------------------------------------------------------------------
+# _call_hierarchy_incoming — @overload regression
+# ---------------------------------------------------------------------------
+
+class TestCallHierarchyIncomingOverload:
+    """Regression: @overload stubs must not appear as incoming callers."""
+
+    def test_overload_stubs_not_reported_as_callers(self, tmp_path):
+        """incomingCalls for a function with @overload must return only real
+        call sites, not the overload stub definitions themselves."""
+        from pylsp_workspace_symbols.plugin import _call_hierarchy_incoming
+
+        src = (
+            "from typing import overload, Union\n"
+            "\n"
+            "@overload\n"
+            "def convert(value: int) -> float: ...\n"
+            "@overload\n"
+            "def convert(value: str) -> bool: ...\n"
+            "\n"
+            "def convert(value):\n"
+            "    pass\n"
+            "\n"
+            "result = convert(1)\n"
+        )
+        f = tmp_path / "mod.py"
+        f.write_text(src, encoding="utf-8")
+
+        # The real implementation is on line 8 (1-based), col 4
+        item = {
+            "name": "convert",
+            "data": {"path": str(f), "line": 8, "column": 4},
+        }
+        workspace = MagicMock()
+        workspace.root_path = str(tmp_path)
+
+        calls = _call_hierarchy_incoming(item, workspace)
+
+        caller_lines = [c["fromRanges"][0]["start"]["line"] for c in calls]
+        # Line 11 (0-based: 10) is `result = convert(1)` — the only real call site
+        assert caller_lines == [10], (
+            f"Expected only the real call site (line 10), got lines: {caller_lines}"
+        )
