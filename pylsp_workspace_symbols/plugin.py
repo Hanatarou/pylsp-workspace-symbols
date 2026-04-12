@@ -2626,8 +2626,12 @@ def _call_hierarchy_incoming(item: dict, workspace) -> List[dict]:
                 continue
             if _in_ignored_folder(str(ref.module_path), _DEFAULT_IGNORE_FOLDERS):
                 continue
-            # Skip the definition line itself
-            if str(ref.module_path) == path and ref.line == item_line:
+            # Skip every definition site: the implementation line AND every
+            # @overload stub.  Jedi returns all of them from get_references()
+            # because they share the same qualified name.  ref.is_definition()
+            # is True for all definition sites and False for actual call sites,
+            # making this a single-line, zero-heuristic fix.
+            if ref.is_definition():
                 continue
 
             ref_path = str(ref.module_path)
