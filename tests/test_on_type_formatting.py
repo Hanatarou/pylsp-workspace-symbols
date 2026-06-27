@@ -157,35 +157,37 @@ class TestNewlineIndent:
 
 
 class TestNewlineDedent:
+    # The client inserts the new line with the inherited indentation before
+    # firing onTypeFormatting.  Source must include that indented new line
+    # and character must point to the end of the inherited whitespace.
 
     def test_dedent_after_return(self):
-        src = "def foo():\n    return 42\n"
-        edits = fmt(src, line=2, character=0, ch="\n")
+        src = "def foo():\n    return 42\n    "
+        edits = fmt(src, line=2, character=4, ch="\n")
         assert edits
-        # newText must not carry the 4-space indent of the return line
         assert not any(e["newText"].startswith("    ") for e in edits)
 
     def test_dedent_after_pass(self):
-        src = "if True:\n    pass\n"
-        edits = fmt(src, line=2, character=0, ch="\n")
+        src = "if True:\n    pass\n    "
+        edits = fmt(src, line=2, character=4, ch="\n")
         assert edits
         assert not any(e["newText"].startswith("    ") for e in edits)
 
     def test_dedent_after_break(self):
-        src = "for i in range(10):\n    break\n"
-        edits = fmt(src, line=2, character=0, ch="\n")
+        src = "for i in range(10):\n    break\n    "
+        edits = fmt(src, line=2, character=4, ch="\n")
         assert edits
         assert not any(e["newText"].startswith("    ") for e in edits)
 
     def test_dedent_after_continue(self):
-        src = "for i in range(10):\n    continue\n"
-        edits = fmt(src, line=2, character=0, ch="\n")
+        src = "for i in range(10):\n    continue\n    "
+        edits = fmt(src, line=2, character=4, ch="\n")
         assert edits
         assert not any(e["newText"].startswith("    ") for e in edits)
 
     def test_dedent_after_raise(self):
-        src = "def foo():\n    raise ValueError()\n"
-        edits = fmt(src, line=2, character=0, ch="\n")
+        src = "def foo():\n    raise ValueError()\n    "
+        edits = fmt(src, line=2, character=4, ch="\n")
         assert edits
         assert not any(e["newText"].startswith("    ") for e in edits)
 
@@ -280,7 +282,7 @@ class TestFstringPromotion:
         assert 'f"hello {' in apply_edits(src, edits)
 
     def test_promotes_single_quoted(self):
-        src = "path = 'user/id{"
+        src = "path = 'user/id{name'"
         edits = fmt(src, line=0, character=16, ch="{")
         assert edits
         assert "f'" in apply_edits(src, edits)
