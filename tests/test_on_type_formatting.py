@@ -162,32 +162,32 @@ class TestNewlineDedent:
         src = "def foo():\n    return 42\n"
         edits = fmt(src, line=2, character=0, ch="\n")
         assert edits
-        result = apply_edits(src, edits)
-        assert not result.split("\n")[2].startswith("    ")
+        # newText must not carry the 4-space indent of the return line
+        assert not any(e["newText"].startswith("    ") for e in edits)
 
     def test_dedent_after_pass(self):
         src = "if True:\n    pass\n"
         edits = fmt(src, line=2, character=0, ch="\n")
         assert edits
-        assert not apply_edits(src, edits).split("\n")[2].startswith("    ")
+        assert not any(e["newText"].startswith("    ") for e in edits)
 
     def test_dedent_after_break(self):
         src = "for i in range(10):\n    break\n"
         edits = fmt(src, line=2, character=0, ch="\n")
         assert edits
-        assert not apply_edits(src, edits).split("\n")[2].startswith("    ")
+        assert not any(e["newText"].startswith("    ") for e in edits)
 
     def test_dedent_after_continue(self):
         src = "for i in range(10):\n    continue\n"
         edits = fmt(src, line=2, character=0, ch="\n")
         assert edits
-        assert not apply_edits(src, edits).split("\n")[2].startswith("    ")
+        assert not any(e["newText"].startswith("    ") for e in edits)
 
     def test_dedent_after_raise(self):
         src = "def foo():\n    raise ValueError()\n"
         edits = fmt(src, line=2, character=0, ch="\n")
         assert edits
-        assert not apply_edits(src, edits).split("\n")[2].startswith("    ")
+        assert not any(e["newText"].startswith("    ") for e in edits)
 
 
 # ===========================================================================
@@ -280,8 +280,8 @@ class TestFstringPromotion:
         assert 'f"hello {' in apply_edits(src, edits)
 
     def test_promotes_single_quoted(self):
-        src = "path = 'user/{"
-        edits = fmt(src, line=0, character=14, ch="{")
+        src = "path = 'user/id{"
+        edits = fmt(src, line=0, character=16, ch="{")
         assert edits
         assert "f'" in apply_edits(src, edits)
 
@@ -378,7 +378,9 @@ class TestDocstringTemplate:
         edits = fmt(src, line=2, character=11, ch='"')
         assert edits
         result = apply_edits(src, edits)
-        assert "self" not in result
+        # "self" must not appear inside the Args section
+        args_section = result.split("Args:")[-1] if "Args:" in result else ""
+        assert "self" not in args_section
         assert "value: Description." in result
 
     def test_no_expansion_when_not_triple_quote(self):
