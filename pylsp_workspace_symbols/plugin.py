@@ -95,6 +95,10 @@ def _inject_capabilities() -> bool:
             caps.setdefault("documentLinkProvider", {"resolveProvider": False})
             caps.setdefault("colorProvider", True)
             caps.setdefault("codeLensProvider", {"resolveProvider": False})
+            caps.setdefault("documentOnTypeFormattingProvider", {
+                "firstTriggerCharacter": "\n",
+                "moreTriggerCharacter": [":", "{", "#", ")", "]", "}", '"'],
+            })
             # Merge our commands into executeCommandProvider without clobbering
             # pylsp-rope's existing commands (they register via the same key).
             existing_cmds = caps.get("executeCommandProvider", {}).get("commands", [])
@@ -288,6 +292,19 @@ def pylsp_settings(config) -> dict:
             "semantic_tokens": {
                 "enabled": False,  # opt-in: can be slow on very large files
             },
+            "on_type_formatting": {
+                "enabled": True,
+                "indent_size": 4,            # fallback when client omits tabSize
+                "dedent_keywords": True,     # dedent after return/pass/raise/break/continue
+                "colon_dedent": True,        # align else/elif/except/finally/case on ':'
+                "colon_space": True,         # insert space after ':' in dict literals and annotations
+                "bracket_indent": True,      # hanging indent inside open (), [], {}
+                "auto_format_strings": True, # insert 'f' when typing '{' in a string (basedpyright parity)
+                "hash_space": True,          # insert space after '#' (PEP 8 inline comment style)
+                "auto_docstring": True,      # insert Google-style docstring template after """
+                "closer_align": True,        # align multiline ) ] } closer to its opener line
+                "debug": False,              # log incoming params and outgoing edits (POC / troubleshooting)
+            },
         }
     }
 
@@ -376,6 +393,11 @@ def pylsp_experimental_capabilities(config, workspace) -> dict:
             },
             "full": {"delta": True},
             "range": True,
+        }
+    if config.plugin_settings("on_type_formatting").get("enabled", True):
+        caps["documentOnTypeFormattingProvider"] = {
+            "firstTriggerCharacter": "\n",
+            "moreTriggerCharacter": [":", "{", "#", ")", "]", "}", '"'],
         }
     return caps
 
@@ -664,6 +686,44 @@ def pylsp_dispatchers(config, workspace) -> dict:
         dispatch["textDocument/semanticTokens/full"] = _semantic_tokens_full
         dispatch["textDocument/semanticTokens/full/delta"] = _semantic_tokens_full_delta
         dispatch["textDocument/semanticTokens/range"] = _semantic_tokens_range
+
+    # -- On-type formatting ----------------------------------------------------
+    settings_otf = config.plugin_settings("on_type_formatting")
+    if settings_otf.get("enabled", True):
+        def _on_type_formatting(params) -> List[dict]:
+            if not isinstance(params, dict):
+                return []
+            uri = (params.get("textDocument") or {}).get("uri")
+            if not uri:
+                return []
+            debug = settings_otf.get("debug", False)
+            if debug:
+                log.info(
+                    "pylsp_workspace_symbols: onTypeFormatting <- "
+                    "ch=%r position=%r options=%r",
+                    params.get("ch"),
+                    params.get("position"),
+                    params.get("options"),
+                )
+            try:
+                document = workspace.get_document(uri)
+                edits = _on_type_format(
+                    document.source,
+                    params.get("position") or {},
+                    params.get("ch", ""),
+                    params.get("options") or {},
+                    settings_otf,
+                )
+                if debug:
+                    log.info(
+                        "pylsp_workspace_symbols: onTypeFormatting -> %r", edits
+                    )
+                return edits
+            except Exception as exc:
+                log.exception("pylsp_workspace_symbols: onTypeFormatting: %s", exc)
+                return []
+
+        dispatch["textDocument/onTypeFormatting"] = _on_type_formatting
 
     return dispatch
 
@@ -3685,7 +3745,7 @@ def _get_code_lenses(
             intra-file AST map. If ``cross_file_implementations=True``,
             additionally call ``_count_cross_file_subtypes`` /
             ``_count_cross_file_overrides`` for cross-file counts.
-      3. Emit lenses in order: references → implementations → run/test.
+      3. Emit lenses in order: references -> implementations -> run/test.
 
     Lens types produced:
       - ``👥 N references``     - every top-level/class function, method, class
@@ -4225,3 +4285,801 @@ def _collect_document_colors(source: str) -> List[dict]:
                     pass
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# On-type formatting - implementation
+# ---------------------------------------------------------------------------
+#
+# textDocument/onTypeFormatting returns TextEdit[] computed as the user types a
+# trigger character.  Three independent, individually-toggleable behaviours,
+# none of which need Jedi (pure textual analysis -> works even when Jedi is
+# unavailable, unlike most of this plugin):
+#
+#   "\n" (Enter)  -> recompute the indentation of the freshly created line from
+#                    the preceding logical line: indent one level after a block
+#                    opener (line ending in ':'), inside an open bracket, or
+#                    after a '\' continuation; dedent one level after
+#                    return/pass/raise/break/continue; otherwise keep the same
+#                    indentation.
+#   ":"           -> dedent an else / elif / except / finally / case clause so
+#                    it lines up with its matching opener (if/for/while/try/
+#                    match/...).  Never touches dict literals, slices or
+#                    annotations because those lines do not *start* with one of
+#                    those keywords.
+#   "{"           -> auto f-string (basedpyright parity, the
+#                    analysis.autoFormatStrings feature): typing '{' inside a
+#                    normal string literal inserts an 'f' prefix, turning
+#                    "x" into f"x".  Skips literals that are already f-strings
+#                    and bytes literals.
+#
+# Safety: every edit only ever rewrites the *leading whitespace* of a single
+# line, or inserts a single 'f' before a string's opening quote.  In the worst
+# case (anything ambiguous) the handlers return [] and do nothing - they can
+# never corrupt code.  The edits also respect the client's FormattingOptions
+# (tabSize / insertSpaces), normalising the affected indentation accordingly.
+
+_OTF_DEDENT_KEYWORDS = frozenset({
+    "return", "pass", "raise", "break", "continue",
+})
+
+# clause keyword -> openers it should align with when ':' is typed
+_OTF_COLON_PARTNERS: Dict[str, frozenset] = {
+    "else":    frozenset({"if", "elif", "for", "while", "try"}),
+    "elif":    frozenset({"if", "elif"}),
+    "except":  frozenset({"try", "except"}),
+    "finally": frozenset({"try", "except", "else"}),
+    "case":    frozenset({"match", "case"}),
+}
+
+_OTF_CLAUSE_RE = re.compile(r"^(else|elif|except\*?|finally|case)\b")
+_OTF_LEAD_WORD_RE = re.compile(r"^\s*([A-Za-z_]\w*)")
+
+
+def _otf_indent_unit(options: dict, settings: dict) -> tuple:
+    """Resolve (insert_spaces, tab_size) from LSP FormattingOptions, falling
+    back to the plugin's indent_size, then to (True, 4)."""
+    tab_size = options.get("tabSize")
+    if not isinstance(tab_size, int) or tab_size <= 0:
+        tab_size = settings.get("indent_size", 4)
+    if not isinstance(tab_size, int) or tab_size <= 0:
+        tab_size = 4
+    insert_spaces = options.get("insertSpaces")
+    if not isinstance(insert_spaces, bool):
+        insert_spaces = True
+    return insert_spaces, tab_size
+
+
+def _otf_leading_ws(line: str) -> str:
+    """Return the run of leading spaces/tabs of *line*."""
+    return line[:len(line) - len(line.lstrip(" \t"))]
+
+
+def _otf_indent_width(ws: str, tab_size: int) -> int:
+    """Visual width of a whitespace prefix, expanding tabs to the next stop."""
+    w = 0
+    for ch in ws:
+        if ch == "\t":
+            w += tab_size - (w % tab_size)
+        else:
+            w += 1
+    return w
+
+
+def _otf_render_indent(width: int, insert_spaces: bool, tab_size: int) -> str:
+    """Render an indentation of *width* columns as spaces or tabs+spaces."""
+    if width <= 0:
+        return ""
+    if insert_spaces:
+        return " " * width
+    return "\t" * (width // tab_size) + " " * (width % tab_size)
+
+
+def _otf_strip_strings_comments(line: str) -> str:
+    """Blank out string literals and the trailing ``#`` comment of a single
+    line, preserving column positions, so the result can be safely scanned for
+    brackets, a trailing ':' / '\\', or a leading keyword.
+
+    Multi-line (triple-quoted) strings are out of scope; for the common
+    single-line case this is accurate, and any inaccuracy only ever makes a
+    handler fall back to a no-op.
+    """
+    out: List[str] = []
+    i = 0
+    n = len(line)
+    quote = ""
+    while i < n:
+        ch = line[i]
+        if quote:
+            out.append(" ")
+            if ch == "\\" and i + 1 < n:
+                out.append(" ")
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(" ")
+            i += 1
+            continue
+        if ch == "#":
+            break  # rest of the line is a comment
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _otf_bracket_balance(code: str) -> int:
+    """Net ``opens - closes`` of (), [] and {} on a string-stripped line."""
+    bal = 0
+    for ch in code:
+        if ch in "([{":
+            bal += 1
+        elif ch in ")]}":
+            bal -= 1
+    return bal
+
+
+def _on_type_format(
+    source: str,
+    position: dict,
+    ch: str,
+    options: dict,
+    settings: dict,
+) -> List[dict]:
+    """Dispatch a textDocument/onTypeFormatting request to the right handler.
+
+    Returns a list of TextEdit dicts (possibly empty).  ``ch`` is the trigger
+    character; ``position`` is the LSP position reported by the client.
+    """
+    if not source or not isinstance(position, dict):
+        return []
+
+    line = position.get("line", 0)
+    character = position.get("character", 0)
+    if not isinstance(line, int) or not isinstance(character, int):
+        return []
+
+    # Normalise CRLF so column maths match the client's view of the buffer.
+    lines = [l.rstrip("\r") for l in source.split("\n")]
+
+    insert_spaces, tab_size = _otf_indent_unit(options, settings)
+
+    if ch == "\n":
+        return _otf_newline_edits(lines, line, insert_spaces, tab_size, settings)
+    if ch == ":":
+        edits = []
+        if settings.get("colon_space", True):
+            edits = _otf_colon_space_edits(lines, line, character)
+        if not edits and settings.get("colon_dedent", True):
+            edits = _otf_colon_edits(lines, line, insert_spaces, tab_size)
+        return edits
+    if ch == "{":
+        if not settings.get("auto_format_strings", True):
+            return []
+        return _otf_fstring_edits(lines, line, character)
+    if ch == "#":
+        if not settings.get("hash_space", True):
+            return []
+        return _otf_hash_space_edits(lines, line, character)
+    if ch == '"':
+        if not settings.get("auto_docstring", True):
+            return []
+        # Only fire when the three chars ending at `character` form `"""`
+        cur_line = lines[line] if 0 <= line < len(lines) else ""
+        quote_end = character  # caret is after the typed '"'
+        if cur_line[max(0, quote_end - 3):quote_end] != '"""':
+            return []
+        return _otf_docstring_edits(lines, line, character, insert_spaces, tab_size)
+    if ch in (")", "]", "}"):
+        if not settings.get("closer_align", True):
+            return []
+        return _otf_closer_align_edits(lines, line, character, insert_spaces, tab_size)
+    return []
+
+
+def _otf_newline_edits(
+    lines: List[str],
+    cur: int,
+    insert_spaces: bool,
+    tab_size: int,
+    settings: dict,
+) -> List[dict]:
+    """Recompute the indentation of the freshly created line ``cur`` based on
+    the nearest non-blank line above it."""
+    if cur <= 0 or cur >= len(lines):
+        return []
+
+    ref_idx = cur - 1
+    while ref_idx >= 0 and not lines[ref_idx].strip():
+        ref_idx -= 1
+    if ref_idx < 0:
+        return []
+
+    ref_line = lines[ref_idx]
+    ref_code = _otf_strip_strings_comments(ref_line).rstrip()
+    ref_width = _otf_indent_width(_otf_leading_ws(ref_line), tab_size)
+    unit = tab_size
+
+    balance = _otf_bracket_balance(ref_code) if settings.get("bracket_indent", True) else 0
+    lead_match = _OTF_LEAD_WORD_RE.match(ref_code)
+    lead_word = lead_match.group(1) if lead_match else ""
+
+    if balance > 0:
+        target_w = ref_width + unit          # hanging indent inside open bracket
+    elif ref_code.endswith(":"):
+        target_w = ref_width + unit          # block opener
+    elif ref_code.endswith("\\"):
+        target_w = ref_width + unit          # explicit line continuation
+    elif (settings.get("dedent_keywords", True)
+          and lead_word in _OTF_DEDENT_KEYWORDS):
+        target_w = max(0, ref_width - unit)  # statement that ends the block
+    else:
+        target_w = ref_width                 # keep previous indentation
+
+    cur_ws = _otf_leading_ws(lines[cur])
+    desired = _otf_render_indent(target_w, insert_spaces, tab_size)
+    if desired == cur_ws:
+        return []
+    # The caret sits at column 0 of the new line.  A zero-width insert there
+    # leaves the caret to the LEFT of the inserted indent (confirmed with the
+    # CudaText client).  Instead we emit a replacement whose range END is the
+    # caret position: we rewrite the preceding line break plus the current
+    # leading whitespace as "\n" + the new indent.  Because the caret is at the
+    # end of the replaced range, the editor moves it to the end of the inserted
+    # text - just past the indent, at the writing position.  This is the same
+    # edit shape clang-format produces (no snippet / $0 needed).
+    prev_len = len(lines[cur - 1])
+    return [{
+        "range": {
+            "start": {"line": cur - 1, "character": prev_len},
+            "end":   {"line": cur,     "character": len(cur_ws)},
+        },
+        "newText": "\n" + desired,
+    }]
+
+
+def _otf_colon_edits(
+    lines: List[str],
+    cur: int,
+    insert_spaces: bool,
+    tab_size: int,
+) -> List[dict]:
+    """Dedent an else/elif/except/finally/case clause to align with the opener
+    it belongs to.  Returns [] for anything that is not such a clause (dict
+    literals, slices, annotations, etc. are therefore never touched)."""
+    if cur < 0 or cur >= len(lines):
+        return []
+
+    cur_line = lines[cur]
+    stripped = cur_line.lstrip(" \t")
+    m = _OTF_CLAUSE_RE.match(stripped)
+    if not m:
+        return []
+    keyword = m.group(1).rstrip("*")          # 'except*' -> 'except'
+    partners = _OTF_COLON_PARTNERS.get(keyword)
+    if not partners:
+        return []
+
+    cur_ws = _otf_leading_ws(cur_line)
+    cur_width = _otf_indent_width(cur_ws, tab_size)
+
+    # Walk upward for the nearest partner opener sitting at a shallower indent.
+    target_width: Optional[int] = None
+    for i in range(cur - 1, -1, -1):
+        probe = lines[i]
+        if not probe.strip():
+            continue
+        probe_code = _otf_strip_strings_comments(probe)
+        lw = _OTF_LEAD_WORD_RE.match(probe_code)
+        if not lw:
+            continue
+        probe_width = _otf_indent_width(_otf_leading_ws(probe), tab_size)
+        if probe_width > cur_width:
+            continue                          # deeper body line - skip
+        probe_word = lw.group(1)
+        if probe_word in partners:
+            target_width = probe_width
+            break
+        # A shallower opener that is NOT a partner means we have left the
+        # relevant construct - stop so we never align to something unrelated.
+        if probe_code.rstrip().endswith(":"):
+            break
+
+    if target_width is None or target_width == cur_width:
+        return []
+
+    desired = _otf_render_indent(target_width, insert_spaces, tab_size)
+    return [{
+        "range": {
+            "start": {"line": cur, "character": 0},
+            "end":   {"line": cur, "character": len(cur_ws)},
+        },
+        "newText": desired,
+    }]
+
+
+def _otf_fstring_edits(
+    lines: List[str],
+    line: int,
+    character: int,
+) -> List[dict]:
+    """Insert an 'f' prefix when '{' is typed inside a non-f, non-bytes string
+    literal (basedpyright's analysis.autoFormatStrings)."""
+    if line < 0 or line >= len(lines):
+        return []
+    text = lines[line]
+
+    # Locate the '{' that was just typed.  Most clients report the cursor just
+    # after it (character-1); tolerate clients that report at the '{' itself.
+    # A candidate only counts if that column actually holds a '{'.
+    span = None
+    for bc in (character - 1, character):
+        if 0 <= bc < len(text) and text[bc] == "{":
+            span = _otf_find_enclosing_string(text, bc)
+            if span is not None:
+                break
+    if span is None:
+        return []
+
+    insert_col, prefix, token_start = span
+    low = prefix.lower()
+    if "f" in low:
+        return []   # already an f-string
+    if "b" in low:
+        return []   # bytes literal - cannot be an f-string
+
+    # Guard against gluing 'f' onto a preceding identifier/keyword (e.g. the
+    # rare ``return"x"`` with no space): if the literal abuts a word char, skip.
+    if token_start > 0:
+        prev = text[token_start - 1]
+        if prev.isalnum() or prev == "_":
+            return []
+
+    return [{
+        "range": {
+            "start": {"line": line, "character": insert_col},
+            "end":   {"line": line, "character": insert_col},
+        },
+        "newText": "f",
+    }]
+
+
+def _otf_colon_space_edits(
+    lines: List[str],
+    line: int,
+    character: int,
+) -> List[dict]:
+    """Insert a space after ':' in dict literals and type annotations.
+
+    Skips:
+    - slices (colon inside [...])
+    - the char after the colon is already a space or end-of-line
+    - the colon is inside a string literal or comment
+    - the colon ends a block-opener clause (if/def/class/for/while/with/try/else/etc.)
+    """
+    if line < 0 or line >= len(lines):
+        return []
+    text = lines[line]
+
+    # character is the LSP caret position after the ':' was inserted.
+    # The ':' itself sits at character-1.
+    colon_col = character - 1
+    if colon_col < 0 or colon_col >= len(text) or text[colon_col] != ":":
+        return []
+
+    # Skip if already followed by a space (or end of line).
+    next_col = colon_col + 1
+    if next_col >= len(text) or text[next_col] == " ":
+        return []
+
+    # Skip if the colon is inside a string literal or comment.
+    stripped = _otf_strip_strings_comments(text)
+    if colon_col >= len(stripped) or stripped[colon_col] != ":":
+        return []
+
+    # Skip slices: check if the colon is inside square brackets by counting
+    # bracket balance up to the colon on the stripped line.
+    depth_square = 0
+    depth_paren = 0
+    for i, c in enumerate(stripped[:colon_col]):
+        if c == "[":
+            depth_square += 1
+        elif c == "]":
+            depth_square -= 1
+        elif c == "(":
+            depth_paren += 1
+        elif c == ")":
+            depth_paren -= 1
+    if depth_square > 0:
+        return []
+
+    # Skip block-opener clauses: the stripped line (up to and including the
+    # colon) should not match a keyword clause like 'if x:', 'def f():', etc.
+    code_before = stripped[:next_col].rstrip()
+    lead = _OTF_LEAD_WORD_RE.match(code_before.lstrip())
+    if lead and lead.group(1) in {
+        "if", "elif", "else", "for", "while", "with", "try",
+        "except", "finally", "def", "class", "case", "async",
+    }:
+        return []
+
+    return [{
+        "range": {
+            "start": {"line": line, "character": next_col},
+            "end":   {"line": line, "character": next_col},
+        },
+        "newText": " ",
+    }]
+
+
+def _otf_hash_space_edits(
+    lines: List[str],
+    line: int,
+    character: int,
+) -> List[dict]:
+    """Insert a space between '#' and the following text (PEP 8).
+
+    Skips:
+    - shebangs (#!/)
+    - block separators (## or #!)
+    - '#' inside a string literal
+    - already followed by a space
+    """
+    if line < 0 or line >= len(lines):
+        return []
+    text = lines[line]
+
+    # character is LSP caret position after '#' was inserted; '#' at character-1.
+    hash_col = character - 1
+    if hash_col < 0 or hash_col >= len(text) or text[hash_col] != "#":
+        return []
+
+    # Skip if inside a string literal: _otf_strip_strings_comments blanks
+    # everything after the first unquoted '#', so if the stripped line has no
+    # '#' at this column the original '#' was inside a string.
+    stripped = _otf_strip_strings_comments(text[:hash_col])
+    # If stripping up-to hash_col consumed a quote, the '#' is inside a string.
+    if len(stripped) < hash_col:
+        return []
+
+    # Skip shebangs and block separators.
+    next_col = hash_col + 1
+    if next_col < len(text) and text[next_col] in ("#", "!", " "):
+        return []
+
+    # Replace '#' with '# ' so the caret lands after the space.
+    # A zero-width insert (start == end) leaves the caret to the left of the
+    # inserted text in CudaText; replacing the '#' itself moves it past the space.
+    return [{
+        "range": {
+            "start": {"line": line, "character": hash_col},
+            "end":   {"line": line, "character": next_col},
+        },
+        "newText": "# ",
+    }]
+
+
+# ---------------------------------------------------------------------------
+# OTF: auto-docstring
+# ---------------------------------------------------------------------------
+
+# Regex to match a def/async def line and capture indent, name, raw params.
+_OTF_DEF_RE = re.compile(
+    r'^(?P<indent>\s*)(?:async\s+)?def\s+(?P<name>\w+)\s*\((?P<params>[^)]*)\)'
+    r'(?:\s*->\s*(?P<ret>[^:]+))?\s*:'
+)
+
+# Parameter names to skip in the Args section.
+_OTF_SKIP_PARAMS = frozenset({"self", "cls"})
+
+
+def _otf_docstring_edits(
+    lines: List[str],
+    line: int,
+    character: int,
+    insert_spaces: bool,
+    tab_size: int,
+) -> List[dict]:
+    """Insert a Google-style docstring template when ``\"\"\"`` is typed on the
+    line immediately after a ``def`` or ``class`` statement.
+
+    The trigger character ``\"\"\"`` arrives as a 3-character string.  The client
+    reports the position *after* the three quotes have been inserted.  We look
+    at the current line for the opening ``\"\"\"``, then scan backwards to find
+    the nearest ``def`` or ``class`` header, and emit a replacement that turns
+    the bare ``\"\"\"`` into a full template.
+
+    Template shape (Google style)::
+
+        \"\"\"Summary line.
+
+        Args:
+            param_name: Description.
+
+        Returns:
+            Description.
+        \"\"\"
+
+    If the function has no parameters (besides self/cls) and no return
+    annotation, only the summary line is emitted.
+
+    Skips:
+    - Lines not starting with ``\"\"\"`` (after stripping leading whitespace)
+    - No nearby ``def``/``class`` found within 10 preceding lines
+    - ``\"\"\"`` already has content after it on the same line (user is closing
+      an existing docstring)
+    """
+    if line < 0 or line >= len(lines):
+        return []
+
+    cur_line = lines[line]
+
+    # The three quotes should be on the current line; find their column.
+    stripped_cur = cur_line.lstrip()
+    if not stripped_cur.startswith('"""'):
+        return []
+    indent_str = cur_line[: len(cur_line) - len(stripped_cur)]
+
+    # If there is already content after the opening """ on this line, the user
+    # is editing an existing docstring - don't interfere.
+    after_open = stripped_cur[3:]
+    if after_open.strip():
+        return []
+
+    # Scan back to find def / class (within 10 lines)
+    def_line_idx: Optional[int] = None
+    class_line: Optional[str] = None
+    for i in range(line - 1, max(line - 11, -1), -1):
+        probe = lines[i]
+        probe_stripped = probe.lstrip()
+        if not probe_stripped:
+            continue
+        if _OTF_DEF_RE.match(probe):
+            def_line_idx = i
+            break
+        if re.match(r'^\s*class\s+\w+', probe):
+            class_line = probe
+            break
+        # Stop at unrelated code
+        if probe_stripped and not probe_stripped.startswith('#'):
+            if not re.match(r'^\s*(async\s+)?def\s+', probe):
+                break
+
+    unit = _otf_render_indent(tab_size, insert_spaces, tab_size)
+
+    # Class docstring: just a summary placeholder
+    if class_line is not None:
+        template = (
+            f'"""Summary.\n'
+            f'{indent_str}"""'
+        )
+        col_start = len(cur_line) - len(cur_line.lstrip())
+        col_end = col_start + len(stripped_cur.rstrip())
+        return [{
+            "range": {
+                "start": {"line": line, "character": col_start},
+                "end":   {"line": line, "character": col_end},
+            },
+            "newText": template,
+        }]
+
+    if def_line_idx is None:
+        return []
+
+    # Collect the full signature (may span multiple lines)
+    sig_lines = []
+    depth = 0
+    for j in range(def_line_idx, min(def_line_idx + 15, len(lines))):
+        sig_lines.append(lines[j])
+        for ch in lines[j]:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+        else:
+            continue
+        break
+    sig = ' '.join(l.strip() for l in sig_lines)
+
+    m = _OTF_DEF_RE.match(sig_lines[0]) if sig_lines else None
+    if not m:
+        # Try the joined sig
+        m = _OTF_DEF_RE.match(sig)
+    if not m:
+        return []
+
+    raw_params = m.group('params') or ''
+    ret_annotation = (m.group('ret') or '').strip()
+
+    # Parse parameter names (simple split on comma, strip * ** annotations)
+    params: List[str] = []
+    for p in raw_params.split(','):
+        p = p.strip()
+        if not p:
+            continue
+        # Strip * and ** prefixes
+        p_name = p.lstrip('*').split(':')[0].split('=')[0].strip()
+        if p_name and p_name not in _OTF_SKIP_PARAMS:
+            params.append(p_name)
+
+    # Build template - empty strings in parts become truly blank lines (no
+    # trailing spaces) by joining with '\n' + indent_str only for non-empty parts.
+    _BLANK = '\x00'  # sentinel for blank lines
+
+    parts = ['"""Summary.']
+
+    if params:
+        parts.append(_BLANK)
+        parts.append(f'{unit}Args:')
+        for pname in params:
+            parts.append(f'{unit}    {pname}: Description.')
+
+    has_return = bool(ret_annotation) and ret_annotation not in ('None', 'NoReturn')
+    if has_return:
+        parts.append(_BLANK)
+        parts.append(f'{unit}Returns:')
+        parts.append(f'{unit}    {ret_annotation}: Description.')
+
+    parts.append('"""')
+
+    lines_out = []
+    for part in parts:
+        if part == _BLANK:
+            lines_out.append('')
+        else:
+            lines_out.append(indent_str + part if lines_out else part)
+
+    template = '\n'.join(lines_out)
+
+    col_start = len(indent_str)
+    col_end = col_start + len(stripped_cur.rstrip())
+    return [{
+        "range": {
+            "start": {"line": line, "character": col_start},
+            "end":   {"line": line, "character": col_end},
+        },
+        "newText": template,
+    }]
+
+
+# ---------------------------------------------------------------------------
+# OTF: closer alignment ) ] }
+# ---------------------------------------------------------------------------
+
+def _otf_closer_align_edits(
+    lines: List[str],
+    line: int,
+    character: int,
+    insert_spaces: bool,
+    tab_size: int,
+) -> List[dict]:
+    """Align a multiline closer ``)`` ``]`` ``}`` to the indentation of the
+    line that contains its matching opener.
+
+    Fires only when the closer is the *only* non-whitespace character on the
+    current line (e.g. the user typed ``)`` alone after pressing Enter).
+
+    Skips:
+    - Closers that are not alone on their line
+    - No matching opener found within 200 preceding lines
+    - Indentation already matches the opener line
+    """
+    if line < 0 or line >= len(lines):
+        return []
+
+    cur_line = lines[line]
+    stripped = cur_line.strip()
+
+    # Only a bare closer (possibly with trailing comma/colon, e.g. '),')
+    closer_char = stripped[0] if stripped else ''
+    if closer_char not in (')', ']', '}'):
+        return []
+    # Allow trailing comma or colon after the closer, nothing else
+    rest = stripped[1:].strip()
+    if rest and rest not in (',', ':', ',:', ':,'):
+        return []
+
+    opener_map = {')': '(', ']': '[', '}': '{'}
+    opener_char = opener_map[closer_char]
+
+    cur_ws = _otf_leading_ws(cur_line)
+
+    # Walk backwards to find the matching opener using bracket balance.
+    # Start at balance=1 (the closer on the current line) and scan preceding
+    # lines right-to-left until balance reaches 0.
+    balance = 1
+    opener_line_idx: Optional[int] = None
+    for i in range(line - 1, max(line - 201, -1), -1):
+        code = _otf_strip_strings_comments(lines[i])
+        for ch in reversed(code):
+            if ch == closer_char:
+                balance += 1
+            elif ch == opener_char:
+                balance -= 1
+                if balance == 0:
+                    opener_line_idx = i
+                    break
+        if opener_line_idx is not None:
+            break
+
+    if opener_line_idx is None:
+        return []
+
+    opener_line = lines[opener_line_idx]
+    desired_ws = _otf_leading_ws(opener_line)
+
+    if desired_ws == cur_ws:
+        return []
+
+    return [{
+        "range": {
+            "start": {"line": line, "character": 0},
+            "end":   {"line": line, "character": len(cur_ws)},
+        },
+        "newText": desired_ws,
+    }]
+
+
+def _otf_find_enclosing_string(text: str, col: int):
+    """If *col* falls inside a single-line string literal in *text*, return
+    ``(insert_col, prefix, token_start)``; otherwise None.
+
+    ``insert_col`` is the column of the opening quote (where an 'f' should be
+    inserted, i.e. after any existing prefix), ``prefix`` is the literal's
+    existing prefix (r/b/u/f combos, possibly empty) and ``token_start`` is the
+    column where the whole literal (including its prefix) begins - used by the
+    caller's anti-gluing guard.
+
+    Only a valid string prefix (length <= 2, characters drawn from r/b/u/f) is
+    recognised; stray preceding letters are treated as a separate token so the
+    literal is taken to have an empty prefix.
+    """
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            # Determine the (valid) string prefix immediately before the quote.
+            j = i - 1
+            while j >= 0 and text[j].isalpha():
+                j -= 1
+            run = text[j + 1:i]
+            if (0 < len(run) <= 2
+                    and all(c in "rbufRBUF" for c in run)):
+                prefix = run
+                token_start = j + 1
+            else:
+                prefix = ""
+                token_start = i
+            insert_col = i  # always insert just before the opening quote
+
+            quote = ch
+            # Find the end of this string literal on the same line.
+            k = i + 1
+            closed = False
+            while k < n:
+                c = text[k]
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == quote:
+                    closed = True
+                    break
+                k += 1
+            end = k if closed else n - 1   # unterminated -> to end of line
+
+            # The brace must sit strictly inside the quotes (insert_col is the
+            # opening quote): this rejects the dict/set '{' that lands right
+            # before a string, e.g. d = {"a": 1}.
+            if insert_col < col < end:
+                return (insert_col, prefix, token_start)
+            i = (k + 1) if closed else n
+            continue
+        i += 1
+    return None
