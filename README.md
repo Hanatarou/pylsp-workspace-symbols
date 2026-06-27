@@ -6,9 +6,9 @@
 [![Downloads](https://img.shields.io/pypi/dm/pylsp-workspace-symbols)](https://pypistats.org/packages/pylsp-workspace-symbols)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hanatarou/pylsp-workspace-symbols/blob/main/LICENSE)
 
-A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace symbol search**, **inlay hints**, **code lens**, **semantic tokens**, **call/type hierarchy**, **document links** and **document colors** via [Jedi](https://github.com/davidhalter/jedi).
+A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin that adds **workspace symbol search**, **inlay hints**, **code lens**, **semantic tokens**, **call/type hierarchy**, **document links**, **document colors** and **on-type formatting** via [Jedi](https://github.com/davidhalter/jedi).
 
-> **Why?** `pylsp` does not implement several LSP features natively. This plugin fills those gaps — enabling "Go to Symbol in Workspace", rich type inference hints, code lens overlays, semantic token highlighting, call/type hierarchy navigation, clickable import links, and inline color previews in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others — with broad client compatibility out of the box.
+> **Why?** `pylsp` does not implement several LSP features natively. This plugin fills those gaps — enabling "Go to Symbol in Workspace", rich type inference hints, code lens overlays, semantic token highlighting, call/type hierarchy navigation, clickable import links, inline color previews, and intelligent on-type formatting in any LSP client — including [CudaText](https://cudatext.github.io/), Neovim, Emacs, and others — with broad client compatibility out of the box.
 
 ---
 
@@ -22,6 +22,7 @@ A [python-lsp-server](https://github.com/python-lsp/python-lsp-server) plugin th
 - 🧬 **Type hierarchy** — explore supertypes and subtypes of any class via `typeHierarchy/supertypes` and `typeHierarchy/subtypes`
 - 🔗 **Document links** — clickable links for URLs in comments/strings and import statements (resolves to stdlib source when available)
 - 🎨 **Document colors** — inline color previews for CSS/hex/RGB/HSL color literals in source files
+- ✍️ **On-type formatting** — smart Python formatting as you type: auto-indent/dedent on Enter, space after `:` in dict literals and annotations, clause dedent for `else`/`elif`/`except`/`finally`, f-string promotion on `{`, PEP 8 space after `#`, Google-style docstring template on `"""`, and multiline closer alignment for `)` `]` `}`
 - 🔌 **Broad client compatibility** — capabilities announced via proper LSP channel (works with Neovim, eglot, and any client that does not support experimental capabilities), with automatic fallback to the experimental channel
 - ⚡ **Fast** — results in ~130ms after the first call (Jedi cache warm)
 - 🔤 **Case-insensitive substring match** — `area` finds `calculate_area`, `Cal` finds `Calculator`
@@ -81,6 +82,19 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
       },
       "document_colors": {
         "enabled": true
+      },
+      "on_type_formatting": {
+        "enabled": true,
+        "indent_size": 4,
+        "dedent_keywords": true,
+        "colon_dedent": true,
+        "colon_space": true,
+        "bracket_indent": true,
+        "auto_format_strings": true,
+        "hash_space": true,
+        "auto_docstring": true,
+        "closer_align": true,
+        "debug": false
       }
     }
   }
@@ -147,6 +161,23 @@ Add to your LSP client's `pylsp` settings (e.g. in `settings.json` or equivalent
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `true` | Enable/disable document color previews (hex, RGB, HSL, CSS named colors) |
+
+### On-type formatting options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Enable/disable all on-type formatting |
+| `indent_size` | int | `4` | Fallback indent size when the client omits `tabSize` in the request options |
+| `dedent_keywords` | bool | `true` | Dedent new line after `return`/`pass`/`raise`/`break`/`continue` |
+| `colon_dedent` | bool | `true` | Align `else`/`elif`/`except`/`finally`/`case` to their opener on `:` |
+| `colon_space` | bool | `true` | Insert space after `:` in dict literals and type annotations |
+| `bracket_indent` | bool | `true` | Hanging indent inside unclosed `(`, `[`, `{` on Enter |
+| `auto_format_strings` | bool | `true` | Promote plain string to f-string when `{` is typed inside it |
+| `hash_space` | bool | `true` | Insert space between `#` and comment text (PEP 8) |
+| `auto_docstring` | bool | `true` | Insert Google-style docstring template when `"""` is typed after `def`/`class` |
+| `closer_align` | bool | `true` | Align multiline `)` `]` `}` closer to the indentation of its opener line |
+| `debug` | bool | `false` | Log incoming params and outgoing edits (troubleshooting) |
+
 
 ### Built-in ignored folders
 
@@ -225,6 +256,21 @@ Your LSP client will receive `documentLinkProvider: true`. The following are tur
 
 Your LSP client will receive `colorProvider: true`. Inline color swatches are shown for:
 hex (`#rgb`, `#rrggbb`, `#rrggbbaa`), `rgb()`/`rgba()`, `hsl()`/`hsla()`, and CSS named colors.
+
+### On-type formatting
+
+Your LSP client will receive `documentOnTypeFormattingProvider` in the server capabilities.
+Formatting is applied automatically as you type — no key binding needed beyond the normal typing flow.
+The following triggers are supported:
+
+- **Enter (`\n`)** — smart indent after block openers (`if`, `def`, `class`, `for`, `while`, `with`, `try`, `async`); dedent after `return`/`pass`/`raise`/`break`/`continue`; hanging indent inside unclosed `(`, `[`, `{`
+- **`:`** — inserts a space after `:` in dict literals and type annotations; dedents `else`/`elif`/`except`/`finally`/`case` to align with their opener
+- **`{`** — promotes the enclosing plain string to an f-string (e.g. `"hello "` → `f"hello {"`)
+- **`#`** — inserts a space between `#` and the following text (PEP 8 E262/E265)
+- **`"`** — when the third consecutive `"` completes `"""` on the line after a `def` or `class`, expands a Google-style docstring template with `Args:` and `Returns:` sections inferred from the signature
+- **`)` `]` `}`** — when typed alone on a line, aligns the closer to the indentation of the line containing its matching opener
+
+Each trigger can be disabled independently via `on_type_formatting` settings.
 
 ## 🔍 How it works
 
@@ -318,6 +364,21 @@ Modules without a `.py` source (C extensions, frozen modules, `.pyc`-only embedd
 
 Regex-based scan over the source for color literals: hex (`#rgb`, `#rrggbb`, `#rrggbbaa`), `rgb()`/`rgba()`, `hsl()`/`hsla()`, and the full set of CSS named colors. Each match is returned as an LSP `ColorInformation` with normalised `[0.0, 1.0]` RGBA components.
 
+### On-type formatting
+
+Handled via `textDocument/onTypeFormatting`. A single dispatcher `_on_type_format` receives the
+trigger character and delegates to a family of pure functions over the document line list:
+
+- **`_otf_newline_edits`** — computes the correct indentation for the new line using bracket balance (`_otf_bracket_balance`) and keyword detection; no Jedi calls
+- **`_otf_colon_space_edits`** — detects dict literals and annotations using `_otf_strip_strings_comments` to skip string/comment context and bracket balance to skip slices
+- **`_otf_colon_edits`** — scans backwards for the matching opener keyword (`if`/`for`/`try`/`match`) using `_OTF_COLON_PARTNERS` and re-indents the clause line
+- **`_otf_fstring_edits`** — delegates to `_otf_find_enclosing_string` to locate the quote token, then inserts `f` before the opening quote
+- **`_otf_hash_space_edits`** — checks for shebang/block-separator exceptions and replaces `#` with `# ` so the caret lands after the space
+- **`_otf_docstring_edits`** — parses the nearest `def` signature (up to 15 lines back, multi-line aware) to build a Google-style template with correct `Args:` and `Returns:` entries; blank lines in the template are emitted without trailing whitespace
+- **`_otf_closer_align_edits`** — walks backwards with a bracket balance counter (starting at 1 for the closer) to find the opener line, then replaces the current line's leading whitespace with the opener's indentation
+
+All handlers operate on the already-updated document source (post-`didChange`) and return standard LSP `TextEdit[]` arrays.
+
 ## 🧪 Tests
 
 ```bash
@@ -342,6 +403,7 @@ Please open an issue before submitting a large change.
 - [LSP type hierarchy specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareTypeHierarchy)
 - [LSP document links specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_documentLink)
 - [LSP document colors specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_documentColor)
+- [LSP on-type formatting specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_onTypeFormatting)
 
 ## 👤 Author
 

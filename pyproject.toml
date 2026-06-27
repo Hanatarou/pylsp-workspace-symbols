@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pylsp-workspace-symbols"
-version = "0.6.2"
-description = "Workspace symbols, inlay hints, code lens, semantic tokens, call/type hierarchy, document links and colors for python-lsp-server via Jedi"
+version = "0.7.0"
+description = "Workspace symbols, inlay hints, code lens, semantic tokens, call/type hierarchy, document links, colors and on-type formatting for python-lsp-server via Jedi"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
@@ -15,6 +15,7 @@ keywords = [
     "code-lens", "semantic-tokens",
     "call-hierarchy", "type-hierarchy",
     "document-links", "document-colors",
+    "on-type-formatting",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
